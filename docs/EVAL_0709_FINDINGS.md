@@ -55,6 +55,45 @@ visit mid-episode. Three cube positions (x=0.465, y ∈ {−0.15, 0, +0.15}), vi
   attractor pose from anywhere, rather than continuing a grasp it is already lined up
   for. Consistent with a policy dominated by the dataset-marginal pose distribution.
 
+## Result 3: the predicted 50-step horizon itself is cube-invariant
+
+One query per cube position (x=0.465, y ∈ {−0.15, 0, +0.15}), inspecting the full
+`actions` chunk rather than the executed row. Plot: `outputs/eval/horizon_plot.png`.
+
+The chunk is well-formed — j1/j3/j5/j6 ramp smoothly and monotonically over the 50 steps,
+FK'ing to a TCP path that rises 0.08 m → 0.12 m while drifting to table center. It is
+also the SAME trajectory at every cube position. Base yaw (j0) is the joint that aims the
+arm left/right:
+
+| | cube y=−0.15 | cube y=0.00 | cube y=+0.15 | spread |
+|---|---|---|---|---|
+| j0, horizon row 0  | −0.0334 | −0.0373 | −0.0334 | 0.004 |
+| j0, horizon row 49 | −0.0768 | −0.0611 | −0.0407 | 0.036 |
+| **j0 needed (atan2(y,x))** | **−0.3120** | **0.0000** | **+0.3120** | **0.624** |
+
+The model spans 8% of the required range, never changes sign, and for the y=+0.15 cube
+(needs j0 POSITIVE) it drives j0 more negative — the wrong way. The 0.036 rad of
+cross-position variation is the same magnitude as the flow head's per-query sampling
+noise (0.012 rad on identical inputs), i.e. indistinguishable from zero signal.
+
+The gripper channel never leaves 1.008–1.039 (1=open) across all 150 predicted steps at
+all three positions; the close threshold is 0.5. The model does not plan a grasp at any
+point in its own horizon.
+
+Also checked and NEGATIVE: the `kp3dc_robot` action channels are equally position-locked
+(max 0.030 m deviation across positions for a 0.30 m cube displacement). So this is not
+"the keypoint head learned the task while the joint head is broken" — every output channel
+is blind to the cube at serve time.
+
+**The one lead this leaves.** grifflee reports that during TRAINING, the model's keypoint
+predictions visually tracked the cube correctly. If that holds, the model did learn
+obs-conditioned behavior and something about serve-time inputs is off-distribution. The
+most conspicuous train/serve input difference: the 140-slot state input carries FK robot
+keypoints (kp3dc, 126 of 140 slots) at train time, dropped only with `input_drop_prob`
+= 0.25 — while our serve payload masks out all 126 on EVERY step, an input pattern
+training essentially never produced. Next test on our side: compute FK keypoints
+client-side (`robot_keypoints_in_cameras` + URDF FK; sim has GT calibration) and re-probe.
+
 ## The one ask
 
 Run `scripts/debug/server_compare.py` (or any predict-on-training-batch) for this
