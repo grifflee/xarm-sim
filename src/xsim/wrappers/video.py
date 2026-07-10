@@ -66,8 +66,8 @@ class VideoRecordWrapper(Wrapper):
         self._recording = bool(self.episode_trigger(self._episode_id))
         self._frames = []
         self._inner_step = 0
-        if self._recording:
-            self._capture()
+        # no capture here: Genesis renders stale (pre-reset) images until the first
+        # post-reset step, so a t=0 frame would show the previous episode's end state
         return obs
 
     def step(self, action: Any) -> tuple[Any, float, bool, dict]:
