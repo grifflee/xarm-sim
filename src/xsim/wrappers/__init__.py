@@ -3,6 +3,8 @@
 from xsim.wrappers.action_chunk import ActionChunkWrapper
 from xsim.wrappers.base import Wrapper
 from xsim.wrappers.genesis_gym import GenesisGymAdapter
+from xsim.wrappers.mcap_record import McapRecordWrapper
 from xsim.wrappers.video import VideoRecordWrapper
 
-__all__ = ["Wrapper", "VideoRecordWrapper", "ActionChunkWrapper", "GenesisGymAdapter"]
+__all__ = ["Wrapper", "VideoRecordWrapper", "ActionChunkWrapper", "GenesisGymAdapter",
+           "McapRecordWrapper"]

@@ -14,8 +14,9 @@ deterministically):
 Every rollout lands in ``results.jsonl`` and (with ``--video``) an mp4 with a phase strip:
 gray = reference, green = student on-path, red flash = divergence detected, blue = teacher
 recovery. The strip is video-only (never in obs or recorded data). Scenes whose outcome is
-``corrected`` are the DAgger correction episodes; writing those as training MCAP is a
-follow-up once the takeover behavior is visually verified.
+``corrected`` are the DAgger correction episodes: they are written to ``--mcap-dir`` as
+training MCAP (``<model>_episode_<seed>.mcap`` + merged ``manifest.json``, same format as
+the generator batches, trimmed to end at the release like the demonstration protocol).
 
     # offline validation (no server): a scripted student lied to about the cube position,
     # so it plunges/grasps off-target and the monitor must fire
@@ -49,9 +50,9 @@ from xsim.dagger import (  # noqa: E402
     DAggerPolicy, DaggerThresholds, ExpertReference, ModeStripWrapper, ReferenceRecorder,
 )
 from xsim.teacher import ScriptedTeacherPolicy  # noqa: E402
-from xsim.wrappers import GenesisGymAdapter, VideoRecordWrapper  # noqa: E402
+from xsim.wrappers import GenesisGymAdapter, McapRecordWrapper, VideoRecordWrapper  # noqa: E402
 
-from eval_grid import build_grid, grid_ranges  # noqa: E402  (same-directory import)
+from eval_grid import _git_provenance, _jsonable, build_grid, grid_ranges  # noqa: E402  (same-directory import)
 
 
 @dataclass
@@ -75,6 +76,12 @@ class Config:
     backend: Literal["gpu", "cpu"] = "gpu"
     video: bool = True
     out: Path | None = None            # default: PROJECT_ROOT/outputs/dagger/<task>
+    # `corrected` hybrids are written here as training MCAP (<model>_episode_<seed>.mcap
+    # + manifest.json, same format as the generator batches). None disables MCAP output.
+    mcap_dir: Path | None = Path("/data/store/griffen_sim_mcaps/dagger_mcaps")
+    # names the corrected model in MCAP filenames/manifest; REQUIRED for --student remote
+    # (e.g. 0707_iconic-spaceship-1191), defaults to the student kind for scripted ones
+    model_name: str | None = None
     teacher_steps_per_segment: int = 27  # 108 @ 120 Hz -> 27 @ 30 Hz, same real speed
     thresholds: DaggerThresholds = field(default_factory=DaggerThresholds)
     env: TaskEnvCfg = field(default_factory=lambda: TaskEnvCfg(noslip_iterations=10))
@@ -164,6 +171,15 @@ def run_hybrid(env, policy: DAggerPolicy, seed: int, options: dict,
 # ---------------------------------------------------------------------------------------
 
 
+def _model_name(cfg: Config) -> str:
+    if cfg.model_name:
+        return cfg.model_name
+    if cfg.student != "remote":
+        return cfg.student
+    raise SystemExit("--model-name is required with --student remote so the MCAP "
+                     "filenames say which model the corrections were run on")
+
+
 def _outcome(policy: DAggerPolicy, info: dict) -> str:
     if policy.switch is None:
         return "student_success" if info.get("success") else "student_failed_undetected"
@@ -173,6 +189,7 @@ def _outcome(policy: DAggerPolicy, info: dict) -> str:
 def main(cfg: Config) -> None:
     out = cfg.out if cfg.out is not None else PROJECT_ROOT / "outputs" / "dagger" / cfg.task
     out.mkdir(parents=True, exist_ok=True)
+    model = _model_name(cfg)  # fail fast, before the env spins up
 
     cfg.env.task = cfg.task
     cfg.env.physics_dt = 1.0 / cfg.sim_hz
@@ -187,7 +204,9 @@ def main(cfg: Config) -> None:
     adapter = GenesisGymAdapter(
         TaskEnv(cfg.env), control_every=control_every,
         max_control_steps=cfg.max_control_steps, close_setpoint=cfg.close_setpoint)
-    strip = ModeStripWrapper(adapter)
+    # recorder sits below the strip so buffered MCAP images are clean of the overlay
+    recorder = McapRecordWrapper(adapter, record_dt=control_dt)
+    strip = ModeStripWrapper(recorder)
     env = (VideoRecordWrapper(strip, out / "videos", capture_every=1,
                               fps=float(cfg.control_hz), name_prefix="rollout")
            if cfg.video else strip)
@@ -202,6 +221,7 @@ def main(cfg: Config) -> None:
 
     counts: dict[str, int] = {}
     records: list[dict] = []
+    mcap_episodes: list[dict] = []
     with open(out / "results.jsonl", "a") as results_fh, torch.no_grad():
         for rep in range(cfg.reps):
             for gp in points:
@@ -215,6 +235,7 @@ def main(cfg: Config) -> None:
                 t0 = time.monotonic()
 
                 phase["name"] = "reference"
+                recorder.enabled = False
                 video_id = getattr(env, "_episode_id", -1) + 1
                 reference, ref_info = run_reference(env, teacher, seed, options, control_dt)
                 record.update(ref_len=len(reference), ref_video=video_id)
@@ -228,6 +249,7 @@ def main(cfg: Config) -> None:
                     continue
 
                 phase["name"] = "hybrid"
+                recorder.enabled = cfg.mcap_dir is not None
                 policy.reference = reference
                 info, steps = run_hybrid(env, policy, seed, options)
                 outcome = _outcome(policy, info)
@@ -251,6 +273,27 @@ def main(cfg: Config) -> None:
                         "tcp_err": round(v.tcp_err, 4), "cube_err": round(v.cube_err, 4),
                         "progress": round(v.progress, 3),
                     }
+                if cfg.mcap_dir is not None and outcome == "corrected":
+                    cfg.mcap_dir.mkdir(parents=True, exist_ok=True)
+                    mcap_path = cfg.mcap_dir / f"{model}_episode_{seed:06d}.mcap"
+                    frames = recorder.save(mcap_path)["frames"]
+                    record["mcap"] = str(mcap_path)
+                    entry = {
+                        "episode": seed, "frames": frames, "seed": seed, "kept": True,
+                        "model": model,
+                        "cube_yaw": cfg.cube_yaw, "grid_idx": gp.grid_idx,
+                        "cube_xy": record["cube_xy"], "outcome": outcome,
+                        "switch": record.get("switch"),
+                        "extrinsics": {k: np.asarray(v).tolist()
+                                       for k, v in adapter.episode_extrinsics.items()},
+                    }
+                    for key in ("max_rise", "lifted", "deliver_dist", "delivered",
+                                "success", "drop_target"):
+                        if key in info:
+                            entry[key] = _jsonable(info[key])
+                    mcap_episodes.append(entry)
+                else:
+                    recorder.discard()
                 results_fh.write(json.dumps(record) + "\n")
                 results_fh.flush()
                 records.append(record)
@@ -274,6 +317,25 @@ def main(cfg: Config) -> None:
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
+
+    if cfg.mcap_dir is not None and mcap_episodes:
+        # merge with any existing manifest so successive dagger runs (other models,
+        # other grids) accumulate in one directory. `config` reflects the latest run.
+        manifest_path = cfg.mcap_dir / "manifest.json"
+        existing = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+        by_ep = {(e.get("model"), e["episode"]): e for e in existing.get("episodes", [])}
+        for e in mcap_episodes:
+            by_ep[(e["model"], e["episode"])] = e
+        sha, dirty = _git_provenance()
+        manifest_path.write_text(json.dumps({
+            "source": "scripts/dagger.py",
+            "git_sha": sha, "git_dirty": dirty,
+            "config": _jsonable(cfg),
+            "success_rate": 1.0,  # only corrected (successful) hybrids are kept
+            "episodes": sorted(by_ep.values(), key=lambda e: (e.get("model", ""), e["episode"])),
+        }, indent=2))
+        print(f"mcap: {len(mcap_episodes)} corrected episodes -> {cfg.mcap_dir} "
+              f"(manifest total {len(by_ep)})")
     print(f"\ndagger done: {counts} -> {out}")
 
 
