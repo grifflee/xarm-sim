@@ -322,7 +322,8 @@ def main(cfg: Config) -> None:
         "intervention_reasons": reasons, "seed": cfg.seed,
         "thresholds": {k: getattr(cfg.thresholds, k) for k in
                        ("corridor", "cube_tol_pre", "cube_tol_post",
-                        "max_advance_s", "stall_window_s", "stall_min_advance_s")},
+                        "max_advance_s", "stall_window_s", "stall_min_advance_s",
+                        "handback_frac")},
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2))

@@ -132,6 +132,11 @@ class DaggerThresholds:
     max_advance_s: float = 0.5
     stall_window_s: float = 3.0    # progress lookback horizon
     stall_min_advance_s: float = 0.25  # min reference-time advance over the stall window
+    # handback hysteresis: while an intervention is active, the corridor/cube thresholds
+    # shrink by this factor, so the teacher keeps control until the error is well inside
+    # the corridor (not merely across the boundary) before the student gets another try.
+    # 1.0 = hand back on the first in-corridor step (pure per-step alternation).
+    handback_frac: float = 1.0
 
 
 @dataclass
@@ -158,6 +163,7 @@ class DivergenceMonitor:
         self._stall_min_advance = max(1, int(round(self.thr.stall_min_advance_s / ref.dt)))
         window = max(2, int(round(self.thr.stall_window_s / ref.dt)))
         self._progress_hist: deque[int] = deque(maxlen=window)
+        self._active = False  # last verdict was diverged -> handback hysteresis applies
 
     def update(self, tcp, cube) -> Verdict:
         ref, thr = self.ref, self.thr
@@ -175,8 +181,9 @@ class DivergenceMonitor:
         pre_grasp = idx < ref.grasp_idx
 
         reason = None
-        radius = thr.corridor[min(seg, len(thr.corridor) - 1)]
-        cube_tol = thr.cube_tol_pre if pre_grasp else thr.cube_tol_post
+        shrink = thr.handback_frac if self._active else 1.0
+        radius = thr.corridor[min(seg, len(thr.corridor) - 1)] * shrink
+        cube_tol = (thr.cube_tol_pre if pre_grasp else thr.cube_tol_post) * shrink
         if tcp_err > radius:
             reason = "tcp_off_corridor"
         elif cube_err > cube_tol:
@@ -188,6 +195,7 @@ class DivergenceMonitor:
         if reason is None and full and not at_end \
                 and idx - self._progress_hist[0] < self._stall_min_advance:
             reason = "stalled"
+        self._active = reason is not None
 
         return Verdict(
             diverged=reason is not None, reason=reason, ref_idx=idx,
