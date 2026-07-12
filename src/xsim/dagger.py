@@ -11,20 +11,35 @@ the collection loop in ``scripts/dagger.py`` is the plain gym loop for every pha
     # phase A: reference — roll the teacher alone, record its trace
     # phase B: hybrid    — roll DAggerPolicy on the identical scene (same seed/options)
 
-:class:`DAggerPolicy` runs the student until it diverges from the reference, then hands
-control to the teacher, whose ``reset()`` re-plans from the live (failed) state. Its
+:class:`DAggerPolicy` consults the :class:`DivergenceMonitor` before EVERY control step.
+On a step whose error exceeds the thresholds, the teacher's action is executed instead
+of the student's (the teacher re-plans from live state when an intervention begins);
+control returns to the student on the first clean step after. Interventions are
+per-step — nothing latches. A brief wobble costs one corrective knock, while a
+persistent failure (cube shoved away, missed grasp) keeps the error above threshold and
+so keeps the teacher acting until the state is actually repaired: how long an
+intervention lasts is decided by the state each step, never by a mode switch.
+
 ``step()`` returns ONE control-step action: student chunks are buffered internally and
 doled out one per step (subsuming ``ActionChunkWrapper``), which is what lets the
-:class:`DivergenceMonitor` check every control step instead of once per 50-step chunk.
+monitor check every control step instead of once per 50-step chunk. The buffer is
+dropped at every intervention so the student re-infers from the corrected state.
+
+Data note: crossformer derives action chunks from the recorded MEASURED joint
+trajectory (grain restructure: ``action = future proprio window``); the MCAP carries no
+separate action channel, so there is nothing to relabel. The training data this
+pipeline produces is the executed hybrid trajectory itself — student motion held inside
+the reference corridor by teacher knocks — which is windowed into physically coherent
+chunks by construction.
 
 The monitor's comparison is geometric, not time-indexed: the student is matched to the
 nearest point on the teacher's TCP path *ahead of its last matched point* (monotonic
 progress, advancing at most ``max_advance_s`` of reference time per control step so a
 lurch can't "match" a far-forward path point), so a student that moves slower than the
-teacher but along the right line stays at error ~0. Three triggers fire the takeover:
+teacher but along the right line stays at error ~0. Three triggers fire an intervention:
 
 - ``tcp_off_corridor`` — TCP outside the segment's corridor radius (loose on approach,
-  tight at the plunge/grasp, looser in transport) for ``patience`` consecutive steps;
+  tight at the plunge/grasp, looser in transport);
 - ``cube_disturbed`` / ``cube_off_track`` — the cube strays from the reference cube trace:
   pre-grasp the student knocked it; post-grasp it catches a missed grasp (the reference
   cube rises, the real one doesn't) even when the TCP is perfectly on-path;
@@ -110,7 +125,6 @@ class DaggerThresholds:
     corridor: tuple[float, ...] = (0.06, 0.03, 0.03, 0.05, 0.07, 0.07)
     cube_tol_pre: float = 0.03     # cube may not move before the teacher's grasp point
     cube_tol_post: float = 0.08    # cube must track the reference cube trace after it
-    patience: int = 5              # consecutive breached control steps before takeover
     # max reference-time the matched point may advance per control step. On-pace progress
     # is 1 control step of reference time; the headroom allows a faster-than-teacher
     # student but stops a lurch from "matching" a far-forward path point and reporting
@@ -132,23 +146,20 @@ class Verdict:
 
 
 class DivergenceMonitor:
-    """Call :meth:`update` once per student CONTROL step; fires once and stays fired."""
+    """Call :meth:`update` once per CONTROL step; every verdict is independent — a
+    breached step reads ``diverged=True``, and the next clean step reads ``False``
+    (per-step intervention semantics: nothing latches)."""
 
     def __init__(self, ref: ExpertReference, thresholds: DaggerThresholds | None = None):
         self.ref = ref
         self.thr = thresholds or DaggerThresholds()
         self._idx = 0
-        self._tcp_breach = 0
-        self._cube_breach = 0
         self._max_advance = max(1, int(round(self.thr.max_advance_s / ref.dt)))
         self._stall_min_advance = max(1, int(round(self.thr.stall_min_advance_s / ref.dt)))
         window = max(2, int(round(self.thr.stall_window_s / ref.dt)))
         self._progress_hist: deque[int] = deque(maxlen=window)
-        self._fired: Verdict | None = None
 
     def update(self, tcp, cube) -> Verdict:
-        if self._fired is not None:
-            return self._fired
         ref, thr = self.ref, self.thr
         tcp = np.asarray(tcp, dtype=np.float64).reshape(-1)[:3]
         cube = np.asarray(cube, dtype=np.float64).reshape(-1)[:3]
@@ -165,12 +176,10 @@ class DivergenceMonitor:
 
         reason = None
         radius = thr.corridor[min(seg, len(thr.corridor) - 1)]
-        self._tcp_breach = self._tcp_breach + 1 if tcp_err > radius else 0
         cube_tol = thr.cube_tol_pre if pre_grasp else thr.cube_tol_post
-        self._cube_breach = self._cube_breach + 1 if cube_err > cube_tol else 0
-        if self._tcp_breach >= thr.patience:
+        if tcp_err > radius:
             reason = "tcp_off_corridor"
-        elif self._cube_breach >= thr.patience:
+        elif cube_err > cube_tol:
             reason = "cube_disturbed" if pre_grasp else "cube_off_track"
 
         self._progress_hist.append(idx)
@@ -180,31 +189,34 @@ class DivergenceMonitor:
                 and idx - self._progress_hist[0] < self._stall_min_advance:
             reason = "stalled"
 
-        verdict = Verdict(
+        return Verdict(
             diverged=reason is not None, reason=reason, ref_idx=idx,
             segment=ref.segment_names[seg], tcp_err=tcp_err, cube_err=cube_err,
             progress=idx / max(1, len(ref) - 1),
         )
-        if verdict.diverged:
-            self._fired = verdict
-        return verdict
 
 
 # ---------------------------------------------------------------------------------------
-# DAgger policy: student until divergence, then teacher
+# DAgger policy: student, with per-step teacher interventions
 # ---------------------------------------------------------------------------------------
 
 
 class DAggerPolicy:
     """GymPolicy composing a student and a teacher: ``step(obs)`` -> one joint action.
 
+    The monitor checks the env state before every action. On a breached step the
+    teacher's action is executed (``teacher.reset()`` re-plans from the live state when
+    an intervention begins; consecutive breached steps continue that plan); on a clean
+    step the student's is, resuming immediately after an intervention with its chunk
+    buffer dropped so it re-infers from the corrected state.
+
     ``student.step(obs)`` may return an ``(H, A)`` chunk (a served crossformer) or a
-    single ``(A,)`` action; chunks are buffered and consumed one action per step. The
-    monitor checks the env state before every student action, and on divergence the
-    teacher is ``reset()`` (it re-plans from the live state) and drives from then on.
+    single ``(A,)`` action; chunks are buffered and consumed one action per step.
 
     Privileged like the teacher: reads TCP/cube from ``env`` directly, not from obs.
     Set :attr:`reference` (the scene's teacher trace) before each :meth:`reset`.
+    :attr:`interventions` lists the spans of consecutive teacher-driven control steps,
+    each with the verdict that opened it.
     """
 
     def __init__(self, student, teacher, env,
@@ -216,42 +228,52 @@ class DAggerPolicy:
         self.chunk_h = chunk_h
         self.reference: ExpertReference | None = None
         self.monitor: DivergenceMonitor | None = None
-        self.mode = "student"           # "student" | "teacher"
-        self.switch: Verdict | None = None   # the verdict that triggered the takeover
-        self.switch_step: int | None = None  # control step the takeover happened at
+        self.mode = "student"           # "student" | "teacher", per control step
+        self.interventions: list[dict] = []
         self._steps = 0
         self._chunk: deque[np.ndarray] = deque()
+
+    @property
+    def teacher_steps(self) -> int:
+        """Total control steps driven by the teacher this episode."""
+        return sum(s["end"] - s["start"] + 1 for s in self.interventions)
 
     def reset(self) -> None:
         if self.reference is None:
             raise ValueError("DAggerPolicy.reference must be set before reset()")
         self.monitor = DivergenceMonitor(self.reference, self.thresholds)
         self.mode = "student"
-        self.switch = None
-        self.switch_step = None
+        self.interventions = []
         self._steps = 0
         self._chunk.clear()
         self.student.reset()
 
     def step(self, obs) -> np.ndarray:
-        if self.mode == "student":
-            _, _, _, ee = self.env.proprio()
-            verdict = self.monitor.update(ee[:3], self.env.cube_pos())
-            if verdict.diverged:
-                self.mode = "teacher"
-                self.switch = verdict
-                self.switch_step = self._steps
-                self._chunk.clear()
-                self.teacher.reset()    # re-plan from the live (failed) state
-            else:
-                if not self._chunk:
-                    chunk = np.atleast_2d(
-                        np.asarray(self.student.step(obs), dtype=np.float32))
-                    self._chunk.extend(chunk[: self.chunk_h])
-                self._steps += 1
-                return self._chunk.popleft()
+        _, _, _, ee = self.env.proprio()
+        verdict = self.monitor.update(ee[:3], self.env.cube_pos())
+        step = self._steps
         self._steps += 1
-        return self.teacher.step(obs)
+        if verdict.diverged:
+            if self.mode == "student":  # intervention begins: re-plan from live state
+                self.mode = "teacher"
+                self._chunk.clear()
+                self.teacher.reset()
+                self.interventions.append(dict(
+                    start=step, end=step, reason=verdict.reason,
+                    ref_idx=verdict.ref_idx, segment=verdict.segment,
+                    tcp_err=round(verdict.tcp_err, 4),
+                    cube_err=round(verdict.cube_err, 4),
+                    progress=round(verdict.progress, 3),
+                ))
+            else:
+                self.interventions[-1]["end"] = step
+            return self.teacher.step(obs)
+        self.mode = "student"
+        if not self._chunk:
+            chunk = np.atleast_2d(
+                np.asarray(self.student.step(obs), dtype=np.float32))
+            self._chunk.extend(chunk[: self.chunk_h])
+        return self._chunk.popleft()
 
 
 # ---------------------------------------------------------------------------------------
@@ -261,42 +283,26 @@ class DAggerPolicy:
 
 class ModeStripWrapper(Wrapper):
     """Tints a strip at the top of each rendered view by the current rollout phase, so
-    the takeover moment is visible in the mp4s. Sits between the adapter and
+    interventions are visible in the mp4s: gray = teacher reference rollout, green =
+    student driving, red = teacher intervention step. Sits between the adapter and
     ``VideoRecordWrapper``; set ``mode_fn`` to a callable returning the phase name.
-    The student->teacher transition shows the ``failure`` color for ``flash_frames``
-    captures before settling on the teacher color. Video-only: observations and any
-    recorded episode data are built below this wrapper and never see the strip."""
+    Video-only: observations and any recorded episode data are built below this wrapper
+    and never see the strip."""
 
     COLORS = {
         "reference": (160, 160, 160),  # gray: teacher reference rollout
         "student": (40, 200, 60),      # green: student driving, on-path
-        "failure": (220, 50, 40),      # red: divergence detected (flash at takeover)
-        "teacher": (60, 120, 230),     # blue: teacher recovery driving
+        "teacher": (220, 50, 40),      # red: teacher intervention step
     }
 
-    def __init__(self, env, mode_fn=None, strip_px: int = 12, flash_frames: int = 30):
+    def __init__(self, env, mode_fn=None, strip_px: int = 12):
         super().__init__(env)
         self.mode_fn = mode_fn or (lambda: "")
         self.strip_px = strip_px
-        self.flash_frames = flash_frames
-        self._last_mode = ""
-        self._flash = 0
-
-    def reset(self, **kwargs):
-        self._last_mode = ""
-        self._flash = 0
-        return self.env.reset(**kwargs)
 
     def render(self) -> dict:
-        mode = self.mode_fn()
-        if mode == "teacher" and self._last_mode == "student":
-            self._flash = self.flash_frames
-        self._last_mode = mode
-        if self._flash > 0 and mode == "teacher":
-            self._flash -= 1
-            mode = "failure"
         frames = self.env.render()
-        color = self.COLORS.get(mode)
+        color = self.COLORS.get(self.mode_fn())
         if color is None:
             return frames
         out = {}

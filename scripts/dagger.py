@@ -8,15 +8,21 @@ deterministically):
      through the plain gym loop; its TCP/cube/gripper/segment trace is recorded. A
      teacher failure skips the scene.
   B. **hybrid** — ``xsim.dagger.DAggerPolicy(student, teacher)`` rolls on the identical
-     scene: the student drives until the ``DivergenceMonitor`` fires against the phase-A
-     trace, then the teacher re-plans from the live state and finishes the task.
+     scene: the student drives, and on every control step whose error against the phase-A
+     trace exceeds the thresholds the teacher's action is executed instead (re-planned
+     from live state at the start of each intervention). Control returns to the student
+     on the first clean step — per-step interventions, no latched takeover. A persistent
+     failure keeps the error high and so keeps the teacher acting until it is repaired.
 
 Every rollout lands in ``results.jsonl`` and (with ``--video``) an mp4 with a phase strip:
-gray = reference, green = student on-path, red flash = divergence detected, blue = teacher
-recovery. The strip is video-only (never in obs or recorded data). Scenes whose outcome is
-``corrected`` are the DAgger correction episodes: they are written to ``--mcap-dir`` as
-training MCAP (``<model>_episode_<seed>.mcap`` + merged ``manifest.json``, same format as
-the generator batches, trimmed to end at the release like the demonstration protocol).
+gray = reference, green = student driving, red = teacher intervention step. The strip is
+video-only (never in obs or recorded data). Scenes whose outcome is ``corrected``
+(intervened AND ended in success) are the DAgger correction episodes: they are written to
+``--mcap-dir`` as training MCAP (``<model>_episode_<seed>.mcap`` + merged
+``manifest.json``, same format as the generator batches, trimmed to end at the release
+like the demonstration protocol). Training actions are derived from the recorded measured
+joint trajectory, so the data is the executed hybrid motion itself — student behavior
+held inside the reference corridor by the teacher's knocks.
 
     # offline validation (no server): a scripted student lied to about the cube position,
     # so it plunges/grasps off-target and the monitor must fire
@@ -84,7 +90,10 @@ class Config:
     model_name: str | None = None
     teacher_steps_per_segment: int = 27  # 108 @ 120 Hz -> 27 @ 30 Hz, same real speed
     thresholds: DaggerThresholds = field(default_factory=DaggerThresholds)
-    env: TaskEnvCfg = field(default_factory=lambda: TaskEnvCfg(noslip_iterations=10))
+    # nyx rendering is REQUIRED for training data: the student was trained on nyx images
+    # (splat background, colored robot); raster frames are out-of-domain for it
+    env: TaskEnvCfg = field(default_factory=lambda: TaskEnvCfg(
+        noslip_iterations=10, render_backend="nyx"))
 
 
 class _CubeLiar:
@@ -181,7 +190,7 @@ def _model_name(cfg: Config) -> str:
 
 
 def _outcome(policy: DAggerPolicy, info: dict) -> str:
-    if policy.switch is None:
+    if not policy.interventions:
         return "student_success" if info.get("success") else "student_failed_undetected"
     return "corrected" if info.get("success") else "correction_failed"
 
@@ -265,14 +274,9 @@ def main(cfg: Config) -> None:
                     timeout=bool(info.get("timeout")),
                     wall_s=round(time.monotonic() - t0, 1),
                 )
-                if policy.switch is not None:
-                    v = policy.switch
-                    record["switch"] = {
-                        "step": policy.switch_step, "reason": v.reason,
-                        "ref_idx": v.ref_idx, "segment": v.segment,
-                        "tcp_err": round(v.tcp_err, 4), "cube_err": round(v.cube_err, 4),
-                        "progress": round(v.progress, 3),
-                    }
+                if policy.interventions:
+                    record["interventions"] = policy.interventions
+                    record["teacher_steps"] = policy.teacher_steps
                 if cfg.mcap_dir is not None and outcome == "corrected":
                     cfg.mcap_dir.mkdir(parents=True, exist_ok=True)
                     mcap_path = cfg.mcap_dir / f"{model}_episode_{seed:06d}.mcap"
@@ -283,7 +287,8 @@ def main(cfg: Config) -> None:
                         "model": model,
                         "cube_yaw": cfg.cube_yaw, "grid_idx": gp.grid_idx,
                         "cube_xy": record["cube_xy"], "outcome": outcome,
-                        "switch": record.get("switch"),
+                        "interventions": record.get("interventions"),
+                        "teacher_steps": record.get("teacher_steps"),
                         "extrinsics": {k: np.asarray(v).tolist()
                                        for k, v in adapter.episode_extrinsics.items()},
                     }
@@ -297,22 +302,26 @@ def main(cfg: Config) -> None:
                 results_fh.write(json.dumps(record) + "\n")
                 results_fh.flush()
                 records.append(record)
-                sw = (f"switch@{policy.switch_step} {policy.switch.reason} "
-                      f"seg={policy.switch.segment} prog={policy.switch.progress:.2f}"
-                      if policy.switch else "no divergence")
+                if policy.interventions:
+                    first = policy.interventions[0]
+                    sw = (f"{len(policy.interventions)} interventions / "
+                          f"{policy.teacher_steps} teacher steps, first "
+                          f"{first['reason']}@{first['start']} seg={first['segment']}")
+                else:
+                    sw = "no interventions"
                 print(f"rep{rep} grid{gp.grid_idx:03d} xy=({gp.cube_xy[0]:.3f},{gp.cube_xy[1]:.3f}) "
                       f"{outcome} ({sw}) steps={steps} [{record['wall_s']}s]", flush=True)
 
     env.close()
     reasons: dict[str, int] = {}
     for r in records:
-        if "switch" in r:
-            reasons[r["switch"]["reason"]] = reasons.get(r["switch"]["reason"], 0) + 1
+        for iv in r.get("interventions", []):
+            reasons[iv["reason"]] = reasons.get(iv["reason"], 0) + 1
     summary = {
         "student": cfg.student, "n_scenes": len(records), "outcomes": counts,
-        "divergence_reasons": reasons, "seed": cfg.seed,
+        "intervention_reasons": reasons, "seed": cfg.seed,
         "thresholds": {k: getattr(cfg.thresholds, k) for k in
-                       ("corridor", "cube_tol_pre", "cube_tol_post", "patience",
+                       ("corridor", "cube_tol_pre", "cube_tol_post",
                         "max_advance_s", "stall_window_s", "stall_min_advance_s")},
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
