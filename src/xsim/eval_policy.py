@@ -234,7 +234,14 @@ class ActionSpec:
     fallback_keys: tuple[str, ...] = (
         "action", "joint_action", "joint_actions", "proprio_single", "vector", "qpos", "joints",
     )
-    # If the server returns an action chunk shaped [H, D], execute this row.
+    # If the server returns an action chunk shaped [H, D], execute up to this many rows
+    # open-loop (one control tick each) before querying the server again — the same
+    # one-inference-one-trajectory semantics as eval.py's ActionChunkWrapper. 1 restores
+    # the legacy closed-loop behavior (re-query every tick, execute row ``chunk_index``
+    # only), which dithers in place with flow-sampled chunks: row 0 ≈ the current pose
+    # every query, plus fresh sampling noise.
+    open_loop_h: int = 50
+    # Row executed when ``open_loop_h`` == 1 (legacy closed-loop mode).
     chunk_index: int = 0
     # scale applied to the ee position channels in "ee_abs" (mm->m by default; 1.0 if the
     # server already emits meters). Deltas ("ee_delta") are passed through unscaled.
@@ -266,6 +273,12 @@ class ActionSpec:
 
 class RemotePolicy:
     """Drives a crossformer served over the webpolicy websocket.
+
+    Chunk execution: one server query buffers up to ``ActionSpec.open_loop_h`` rows of the
+    returned action chunk; each :meth:`act` call applies the next buffered row and the
+    server is only queried again once the buffer runs out. ``info.step`` advances one per
+    :meth:`act` (i.e. per control tick), so the timestep sent at each query matches the
+    episode-relative frame index the model saw in training.
 
     ``close_setpoint`` handling: :meth:`Manipulator.go_to_goal` / ``apply_action`` hard-code
     the closed finger dof to ``_gripper_grasp_dof``, so to honor a custom setpoint we mutate
@@ -300,12 +313,14 @@ class RemotePolicy:
         # at the 30 Hz training cadence (record_every=4 physics steps) rather than 120 Hz
         self.control_every = control_every
         self._setpoint_applied = False
-        self._t = 0  # episode-relative policy step, sent as info.step in grainlike payloads
+        self._t = 0  # episode-relative control tick, sent as info.step in grainlike payloads
+        self._pending: list[tuple[np.ndarray, bool]] = []  # buffered (action, is_open) rows
 
     def reset(self) -> None:
         self._client.reset()
         self._setpoint_applied = False  # re-apply close_setpoint on the next act
         self._t = 0
+        self._pending = []
 
     def act(self, env) -> None:
         spec = self.action_spec
@@ -313,10 +328,11 @@ class RemotePolicy:
             env.robot._gripper_grasp_dof = spec.close_setpoint
             self._setpoint_applied = True
 
-        result = self._client.step(self.obs_spec.build(env, self._t))
+        if not self._pending:
+            result = self._client.step(self.obs_spec.build(env, self._t))
+            self._pending = self._chunk_rows(result)
+        action, is_open = self._pending.pop(0)
         self._t += 1
-        action = self._action_vector(result)
-        is_open = self._gripper_open(result, action)
 
         if spec.mode == "ee_abs":
             pos = action[:3] * spec.ee_pos_scale
@@ -345,10 +361,30 @@ class RemotePolicy:
     def done(self) -> bool:
         return False
 
-    def _action_vector(self, result) -> np.ndarray:
+    def _chunk_rows(self, result) -> list[tuple[np.ndarray, bool]]:
+        """Rows of the returned chunk to execute open-loop, as (action, gripper_open)."""
+        spec = self.action_spec
+        if spec.open_loop_h <= 1:
+            indices: list[int] = [spec.chunk_index]  # legacy closed-loop: one fixed row
+        else:
+            indices = list(range(min(spec.open_loop_h, self._n_rows(result))))
+        rows = []
+        for idx in indices:
+            action = self._action_vector(result, idx)
+            rows.append((action, self._gripper_open(result, action, idx)))
+        return rows
+
+    def _n_rows(self, result) -> int:
+        payload = self._action_payload(result)
+        if isinstance(payload, dict):
+            payload = payload.get("joints", next(iter(payload.values())))
+        arr = np.asarray(payload)
+        return arr.reshape(-1, arr.shape[-1]).shape[0] if arr.ndim >= 2 else 1
+
+    def _action_vector(self, result, idx: int) -> np.ndarray:
         if self.action_spec.mode == "joint_abs":
-            return self.action_spec.denorm_joint_action(self._joint_action_vector(result))
-        return self._row_vector(self._action_payload(result))
+            return self.action_spec.denorm_joint_action(self._joint_action_vector(result, idx))
+        return self._row_vector(self._action_payload(result), idx)
 
     def _action_payload(self, result):
         spec = self.action_spec
@@ -366,32 +402,31 @@ class RemotePolicy:
             f"available keys={sorted(result)}"
         )
 
-    def _row_vector(self, value) -> np.ndarray:
+    def _row_vector(self, value, idx: int) -> np.ndarray:
         arr = np.asarray(value, dtype=np.float64)
         if arr.ndim >= 2:
             rows = arr.reshape(-1, arr.shape[-1])
-            idx = self.action_spec.chunk_index
             if not -len(rows) <= idx < len(rows):
-                raise IndexError(f"chunk_index {idx} out of range for action chunk with {len(rows)} rows")
+                raise IndexError(f"row {idx} out of range for action chunk with {len(rows)} rows")
             return rows[idx].reshape(-1)
         return arr.reshape(-1)
 
-    def _joint_action_vector(self, result) -> np.ndarray:
+    def _joint_action_vector(self, result, idx: int) -> np.ndarray:
         payload = self._action_payload(result)
         if isinstance(payload, dict):
             if "joints" in payload:
-                joints = self._row_vector(payload["joints"])
+                joints = self._row_vector(payload["joints"], idx)
             else:
-                joints = np.asarray([self._row_vector(payload[f"joint{i}"])[0] for i in range(1, 8)])
+                joints = np.asarray([self._row_vector(payload[f"joint{i}"], idx)[0] for i in range(1, 8)])
             if "gripper" in payload:
-                gripper = self._row_vector(payload["gripper"])
+                gripper = self._row_vector(payload["gripper"], idx)
             elif self.action_spec.gripper_key and self.action_spec.gripper_key in payload:
-                gripper = self._row_vector(payload[self.action_spec.gripper_key])
+                gripper = self._row_vector(payload[self.action_spec.gripper_key], idx)
             else:
                 gripper = np.asarray([1.0])
             return np.concatenate([joints[:7], [float(gripper[0])]])
 
-        slots = self._row_vector(payload)
+        slots = self._row_vector(payload, idx)
         dof_ids = result.get("dof_ids") if isinstance(result, dict) else None
         if dof_ids is not None:
             ids = np.asarray(dof_ids).reshape(-1)
@@ -409,14 +444,14 @@ class RemotePolicy:
             raise ValueError(f"joint_abs action needs 8 values, got shape {np.asarray(payload).shape}")
         return slots[:8]
 
-    def _gripper_open(self, result, action: np.ndarray) -> bool:
+    def _gripper_open(self, result, action: np.ndarray, idx: int) -> bool:
         spec = self.action_spec
         if spec.gripper_key is not None and isinstance(result, dict):
             payload = self._action_payload(result)
             if isinstance(payload, dict) and spec.gripper_key in payload:
-                g = float(self._row_vector(payload[spec.gripper_key])[0])
+                g = float(self._row_vector(payload[spec.gripper_key], idx)[0])
             elif spec.gripper_key in result:
-                g = float(self._row_vector(result[spec.gripper_key])[0])
+                g = float(self._row_vector(result[spec.gripper_key], idx)[0])
             else:
                 g = float(action[spec.gripper_index]) if spec.gripper_index is not None else 1.0
         elif spec.gripper_index is not None:
