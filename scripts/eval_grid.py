@@ -412,6 +412,22 @@ def write_summary(out_dir: Path, cfg: Config, resolved_out: Path, points: list[G
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
 
+def _mark_robot(ax, xs: list[float], ys: list[float], x_pad: float, y_pad: float) -> None:
+    """Anchor the plot to the robot: base marker at the world origin, facing arrow, and
+    robot-left/right side labels. The base is at (0,0) and the arm faces +x (toward the
+    grid); standing behind the robot, +y is its left. Axes widen to include the origin."""
+    ax.set_xlim(-0.05, xs[-1] + x_pad)
+    ax.set_ylim(ys[0] - y_pad, ys[-1] + y_pad)
+    ax.scatter([0.0], [0.0], marker="s", s=150, c="#222222", zorder=6)
+    ax.annotate("robot base (0,0)", (0.0, 0.0), textcoords="offset points", xytext=(0, 11),
+                ha="center", fontsize=8, color="#222222", zorder=6)
+    ax.annotate("", xy=(0.14, 0.0), xytext=(0.025, 0.0),
+                arrowprops=dict(arrowstyle="->", color="#222222", lw=1.6), zorder=6)
+    ax.text(0.08, -0.008, "facing +x", fontsize=7, ha="center", va="top", color="#222222")
+    ax.text(0.16, ys[-1], "+y = robot's left", fontsize=7, ha="left", va="top", color="#555555")
+    ax.text(0.16, ys[0], "−y = robot's right", fontsize=7, ha="left", va="bottom", color="#555555")
+
+
 def write_grid_layout(out_dir: Path, cfg: Config, points: list[GridPoint],
                       xs: list[float], ys: list[float]) -> None:
     """Write a labeled top-down grid layout for visual audit of trial positions."""
@@ -437,8 +453,7 @@ def write_grid_layout(out_dir: Path, cfg: Config, points: list[GridPoint],
         ax.set_title(f"{cfg.task} eval grid ({cfg.grid_nx}x{cfg.grid_ny})")
         ax.set_xlabel("cube x (m)")
         ax.set_ylabel("cube y (m)")
-        ax.set_xlim(xs[0] - x_pad, xs[-1] + x_pad)
-        ax.set_ylim(ys[0] - y_pad, ys[-1] + y_pad)
+        _mark_robot(ax, xs, ys, x_pad, y_pad)
         ax.set_xticks(xs, [f"{v:.2f}" for v in xs], rotation=90, fontsize=7)
         ax.set_yticks(ys, [f"{v:.2f}" for v in ys], fontsize=7)
         ax.grid(True, alpha=0.25)
@@ -470,7 +485,7 @@ def _grid_layout_cv2(path: Path, cfg: Config, points: list[GridPoint], xs: list[
     h = max(360, cfg.grid_ny * 58 + 100)
     margin_l, margin_r, margin_t, margin_b = 64, 28, 46, 48
     img = np.full((h, w, 3), 245, dtype=np.uint8)
-    x0, x1 = xs[0], xs[-1]
+    x0, x1 = -0.05, xs[-1]  # include the robot base at the world origin
     y0, y1 = ys[0], ys[-1]
     xr = max(x1 - x0, 1e-6)
     yr = max(y1 - y0, 1e-6)
@@ -504,6 +519,12 @@ def _grid_layout_cv2(path: Path, cfg: Config, points: list[GridPoint], xs: list[
         cv2.circle(img, (u, v), 9, (0, 0, 0), 1)
         label = f"{gp.grid_idx}" if cfg.task != "stack" else f"{gp.grid_idx}/G{gp.green_anchor_index}"
         cv2.putText(img, label, (u - 15, v - 13), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (20, 20, 20), 1)
+    u, v = px(0.0, 0.0)
+    cv2.rectangle(img, (u - 7, v - 7), (u + 7, v + 7), (30, 30, 30), -1)
+    ua, _ = px(0.14, 0.0)
+    cv2.arrowedLine(img, (u + 9, v), (ua, v), (30, 30, 30), 2)
+    cv2.putText(img, "robot base (0,0), facing +x", (u - 10, v - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.36, (20, 20, 20), 1, cv2.LINE_AA)
     cv2.imwrite(str(path), img)
 
 
@@ -535,6 +556,9 @@ def write_heatmap(out_dir: Path, cfg: Config, points: list[GridPoint],
                        extent=[x_min, x_max, y_min, y_max])
         ax.set_xlabel("cube x (m)")
         ax.set_ylabel("cube y (m)")
+        x_pad = max(0.02, (x_max - x_min) * 0.08)
+        y_pad = max(0.02, (y_max - y_min) * 0.08)
+        _mark_robot(ax, xs, ys, x_pad, y_pad)
         ax.set_xticks([round(v, 3) for v in xs], [f"{v:.2f}" for v in xs], rotation=90, fontsize=7)
         ax.set_yticks([round(v, 3) for v in ys], [f"{v:.2f}" for v in ys], fontsize=7)
         ax.set_title(title)
@@ -571,6 +595,8 @@ def _heatmap_cv2(path: Path, grid: np.ndarray, title: str) -> None:
             cv2.putText(img, text, (x0 + 6, y0 + cell // 2 + 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(img, title, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(img, "robot base at x=0, left of this map (facing +x); top = robot's left (+y)",
+                (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
     cv2.imwrite(str(path), img)
 
 
