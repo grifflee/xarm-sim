@@ -18,9 +18,11 @@ Every rollout lands in ``results.jsonl`` and (with ``--video``) an mp4 with a ph
 gray = reference, green = student driving, red = teacher intervention step. The strip is
 video-only (never in obs or recorded data). Scenes whose outcome is ``corrected``
 (intervened AND ended in success) are the DAgger correction episodes: they are written to
-``--mcap-dir`` as training MCAP (``<model>_episode_<seed>.mcap`` + merged
-``manifest.json``, same format as the generator batches, trimmed to end at the release
-like the demonstration protocol). Training actions are derived from the recorded measured
+``--mcap-dir/<model>/<dagger-version>/<generation-run>/`` as training MCAP
+(``<model>_episode_<seed>.mcap`` + a run-local ``manifest.json``, same format as the
+generator batches, trimmed to end at the release like the demonstration protocol).
+Corrected episodes whose trimmed length exceeds ``--max-training-frames`` are demoted to
+``corrected_too_long`` and never written. Training actions are derived from the recorded measured
 joint trajectory, so the data is the executed hybrid motion itself — student behavior
 held inside the reference corridor by the teacher's knocks.
 
@@ -30,7 +32,8 @@ held inside the reference corridor by the teacher's knocks.
     # sanity: student == teacher; must complete with no divergence
     uv run python scripts/dagger.py --student expert --grid-nx 2 --grid-ny 2
     # the served crossformer (grainlike serving stack)
-    uv run python scripts/dagger.py --student remote --host localhost --port 8001
+    uv run python scripts/dagger.py --student remote --host 127.0.0.1 --port 9001 \
+        --model-name 0715_still-star-1213 --dagger-version perstep-v1
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Literal
@@ -58,7 +62,7 @@ from xsim.dagger import (  # noqa: E402
 from xsim.teacher import ScriptedTeacherPolicy  # noqa: E402
 from xsim.wrappers import GenesisGymAdapter, McapRecordWrapper, VideoRecordWrapper  # noqa: E402
 
-from eval_grid import _git_provenance, _jsonable, build_grid, grid_ranges  # noqa: E402  (same-directory import)
+from eval_grid import GridPoint, _git_provenance, _jsonable, build_grid, grid_ranges  # noqa: E402  (same-directory import)
 
 
 @dataclass
@@ -66,28 +70,48 @@ class Config:
     task: Literal["lift"] = "lift"     # stack: after the lift pilot is verified
     student: Literal["remote", "expert", "perturbed"] = "remote"
     host: str = "localhost"            # webpolicy inference server (grainlike serve)
-    port: int = 8001
+    port: int = 9001                 # grifflee: use 9xxx ports for model serving
     chunk_h: int = 50                  # student actions executed per policy inference
     grid_nx: int = 3
     grid_ny: int = 3
     reps: int = 1
-    seed: int = 61000                  # clear of training (9k/20k/30k+) and eval (51k) ranges
+    seed: int = 61000                  # 61000-61999 reserved for dagger; clear of training (9k/20k/30k+) and eval (51k)
+    # Gap targeting: rerun the cells of a previous eval run (its results.jsonl) instead of
+    # a fresh uniform grid — grid_nx/grid_ny are ignored. --cells failed (default) keeps
+    # only the cells the evaluated model did not solve, i.e. exactly the learning gaps.
+    cells_from: Path | None = None
+    cells: Literal["failed", "all"] = "failed"
     cube_yaw: float = 0.0
     perturb_xy: float = 0.05           # cube-position lie (m) for --student perturbed
-    # hybrid budget: student segment + takeover recovery, so ~2x the eval time limit
+    # Hybrid budgets. max_control_steps caps the ROLLOUT (student segment + takeover
+    # recovery, ~2x the eval time limit) so slow scenes still finish and yield stats.
+    # max_training_frames gates what is KEPT: a corrected episode whose release-trimmed
+    # length exceeds it becomes ``corrected_too_long`` — counted and videoed, no MCAP.
+    # Demos run 152-227 frames (batch_2500_nyx_20000); 450 = 2x the demo max. Longer
+    # episodes are timestep-OOD, dominate the sample mix, and mostly record dithery
+    # leashed motion. (The converter's UnpackFlatMap max_fan_out=1500 is where conversion
+    # breaks, not a data target.)
     max_control_steps: int = 1200      # 40 s at 30 Hz
+    max_training_frames: int = 450     # keep gate on the release-trimmed episode length
     sim_hz: int = 120
     control_hz: int = 30
     close_setpoint: float = 0.58       # closed-finger dof (training value)
     backend: Literal["gpu", "cpu"] = "gpu"
     video: bool = True
-    out: Path | None = None            # default: PROJECT_ROOT/outputs/dagger/<task>
-    # `corrected` hybrids are written here as training MCAP (<model>_episode_<seed>.mcap
-    # + manifest.json, same format as the generator batches). None disables MCAP output.
+    out: Path | None = None            # explicit diagnostics dir; None uses the run layout
+    # Root for corrected training MCAP runs. Each invocation creates
+    #   <mcap-dir>/<model>/<dagger-version>/<generation-run>/
+    # containing its own manifest and episodes, so models/policy revisions never mix.
+    # None disables MCAP output.
     mcap_dir: Path | None = Path("/data/store/griffen_sim_mcaps/dagger_mcaps")
     # names the corrected model in MCAP filenames/manifest; REQUIRED for --student remote
     # (e.g. 0707_iconic-spaceship-1191), defaults to the student kind for scripted ones
     model_name: str | None = None
+    # Semantic version of the intervention policy/data recipe, used in the output path.
+    dagger_version: str = "perstep-v1"
+    # Optional leaf directory for this invocation. None creates a timestamped name that
+    # also records the seed/grid/repetition shape (e.g. 20260715_173012_seed62000_10x10_r1).
+    generation_run: str | None = None
     teacher_steps_per_segment: int = 27  # 108 @ 120 Hz -> 27 @ 30 Hz, same real speed
     thresholds: DaggerThresholds = field(default_factory=DaggerThresholds)
     # nyx rendering is REQUIRED for training data: the student was trained on nyx images
@@ -189,6 +213,50 @@ def _model_name(cfg: Config) -> str:
                      "filenames say which model the corrections were run on")
 
 
+def _path_component(value: str, label: str) -> str:
+    """Filesystem-safe, readable identifier; reject values that collapse to nothing."""
+    component = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-.")
+    if not component:
+        raise SystemExit(f"--{label} must contain at least one letter or number")
+    return component
+
+
+def _generation_run(cfg: Config, n_cells: int) -> str:
+    if cfg.generation_run:
+        return _path_component(cfg.generation_run, "generation-run")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    shape = f"cells{n_cells}" if cfg.cells_from is not None else f"{cfg.grid_nx}x{cfg.grid_ny}"
+    return f"{stamp}_seed{cfg.seed}_{shape}_r{cfg.reps}"
+
+
+def _cells_from_eval(path: Path, which: str) -> list[GridPoint]:
+    """Grid cells of a previous eval run, from its results.jsonl (deduped by grid_idx;
+    ``failed`` keeps cells that failed in at least one rep)."""
+    points: dict[int, GridPoint] = {}
+    with open(path) as fh:
+        for line in fh:
+            r = json.loads(line)
+            if r.get("grid_idx") in points or (which == "failed" and r.get("success")):
+                continue
+            points[r["grid_idx"]] = GridPoint(
+                grid_idx=int(r["grid_idx"]), ix=-1, iy=-1,
+                cube_xy=(float(r["cube_xy"][0]), float(r["cube_xy"][1])))
+    if not points:
+        raise SystemExit(f"--cells-from {path}: no matching cells (--cells {which})")
+    return [points[i] for i in sorted(points)]
+
+
+def _run_dir(root: Path, model: str, cfg: Config, generation_run: str) -> Path:
+    return (root / _path_component(model, "model-name")
+            / _path_component(cfg.dagger_version, "dagger-version")
+            / generation_run)
+
+
+def _validate_training_budget(cfg: Config) -> None:
+    if cfg.max_training_frames <= 0:
+        raise SystemExit("--max-training-frames must be positive")
+
+
 def _outcome(policy: DAggerPolicy, info: dict) -> str:
     if not policy.interventions:
         return "student_success" if info.get("success") else "student_failed_undetected"
@@ -196,17 +264,27 @@ def _outcome(policy: DAggerPolicy, info: dict) -> str:
 
 
 def main(cfg: Config) -> None:
-    out = cfg.out if cfg.out is not None else PROJECT_ROOT / "outputs" / "dagger" / cfg.task
-    out.mkdir(parents=True, exist_ok=True)
     model = _model_name(cfg)  # fail fast, before the env spins up
+    _validate_training_budget(cfg)
 
     cfg.env.task = cfg.task
     cfg.env.physics_dt = 1.0 / cfg.sim_hz
     control_every = max(1, round(cfg.sim_hz / cfg.control_hz))
     control_dt = control_every * cfg.env.physics_dt
 
-    x_range, y_range = grid_ranges(cfg, cfg.env)
-    points, _, _ = build_grid(cfg.task, cfg.grid_nx, cfg.grid_ny, x_range, y_range)
+    if cfg.cells_from is not None:
+        points = _cells_from_eval(cfg.cells_from, cfg.cells)
+        print(f"cells: {len(points)} {cfg.cells} cells from {cfg.cells_from}")
+    else:
+        x_range, y_range = grid_ranges(cfg, cfg.env)
+        points, _, _ = build_grid(cfg.task, cfg.grid_nx, cfg.grid_ny, x_range, y_range)
+
+    generation_run = _generation_run(cfg, len(points))
+    default_out_root = PROJECT_ROOT / "outputs" / "dagger"
+    out = cfg.out if cfg.out is not None else _run_dir(default_out_root, model, cfg, generation_run)
+    mcap_run_dir = (_run_dir(cfg.mcap_dir, model, cfg, generation_run)
+                    if cfg.mcap_dir is not None else None)
+    out.mkdir(parents=True, exist_ok=True)
 
     gs.init(backend=gs.gpu if cfg.backend == "gpu" else gs.cpu,
             precision="32", logging_level="warning")
@@ -258,10 +336,14 @@ def main(cfg: Config) -> None:
                     continue
 
                 phase["name"] = "hybrid"
-                recorder.enabled = cfg.mcap_dir is not None
+                recorder.enabled = mcap_run_dir is not None
                 policy.reference = reference
                 info, steps = run_hybrid(env, policy, seed, options)
                 outcome = _outcome(policy, info)
+                trim_frames = recorder.trimmed_frames if mcap_run_dir is not None else None
+                if outcome == "corrected" and trim_frames is not None \
+                        and trim_frames > cfg.max_training_frames:
+                    outcome = "corrected_too_long"
                 counts[outcome] = counts.get(outcome, 0) + 1
                 record.update(
                     outcome=outcome,
@@ -274,12 +356,14 @@ def main(cfg: Config) -> None:
                     timeout=bool(info.get("timeout")),
                     wall_s=round(time.monotonic() - t0, 1),
                 )
+                if trim_frames is not None:
+                    record["trim_frames"] = trim_frames
                 if policy.interventions:
                     record["interventions"] = policy.interventions
                     record["teacher_steps"] = policy.teacher_steps
-                if cfg.mcap_dir is not None and outcome == "corrected":
-                    cfg.mcap_dir.mkdir(parents=True, exist_ok=True)
-                    mcap_path = cfg.mcap_dir / f"{model}_episode_{seed:06d}.mcap"
+                if mcap_run_dir is not None and outcome == "corrected":
+                    mcap_run_dir.mkdir(parents=True, exist_ok=True)
+                    mcap_path = mcap_run_dir / f"{model}_episode_{seed:06d}.mcap"
                     frames = recorder.save(mcap_path)["frames"]
                     record["mcap"] = str(mcap_path)
                     entry = {
@@ -318,8 +402,15 @@ def main(cfg: Config) -> None:
         for iv in r.get("interventions", []):
             reasons[iv["reason"]] = reasons.get(iv["reason"], 0) + 1
     summary = {
-        "student": cfg.student, "n_scenes": len(records), "outcomes": counts,
+        "student": cfg.student, "model": model,
+        "dagger_version": cfg.dagger_version, "generation_run": generation_run,
+        "mcap_run_dir": str(mcap_run_dir) if mcap_run_dir is not None else None,
+        "n_scenes": len(records), "outcomes": counts,
+        "cells_from": str(cfg.cells_from) if cfg.cells_from is not None else None,
+        "cells": cfg.cells if cfg.cells_from is not None else None,
         "intervention_reasons": reasons, "seed": cfg.seed,
+        "max_control_steps": cfg.max_control_steps,
+        "max_training_frames": cfg.max_training_frames,
         "thresholds": {k: getattr(cfg.thresholds, k) for k in
                        ("corridor", "cube_tol_pre", "cube_tol_post",
                         "max_advance_s", "stall_window_s", "stall_min_advance_s",
@@ -328,10 +419,10 @@ def main(cfg: Config) -> None:
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    if cfg.mcap_dir is not None and mcap_episodes:
-        # merge with any existing manifest so successive dagger runs (other models,
-        # other grids) accumulate in one directory. `config` reflects the latest run.
-        manifest_path = cfg.mcap_dir / "manifest.json"
+    if mcap_run_dir is not None and mcap_episodes:
+        # A run directory owns one manifest. Re-running an explicit generation_run merges
+        # by (model, episode), while the default timestamped run remains isolated.
+        manifest_path = mcap_run_dir / "manifest.json"
         existing = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
         by_ep = {(e.get("model"), e["episode"]): e for e in existing.get("episodes", [])}
         for e in mcap_episodes:
@@ -340,11 +431,15 @@ def main(cfg: Config) -> None:
         manifest_path.write_text(json.dumps({
             "source": "scripts/dagger.py",
             "git_sha": sha, "git_dirty": dirty,
+            "model": model,
+            "dagger_version": cfg.dagger_version,
+            "generation_run": generation_run,
+            "mcap_run_dir": str(mcap_run_dir),
             "config": _jsonable(cfg),
             "success_rate": 1.0,  # only corrected (successful) hybrids are kept
             "episodes": sorted(by_ep.values(), key=lambda e: (e.get("model", ""), e["episode"])),
         }, indent=2))
-        print(f"mcap: {len(mcap_episodes)} corrected episodes -> {cfg.mcap_dir} "
+        print(f"mcap: {len(mcap_episodes)} corrected episodes -> {mcap_run_dir} "
               f"(manifest total {len(by_ep)})")
     print(f"\ndagger done: {counts} -> {out}")
 

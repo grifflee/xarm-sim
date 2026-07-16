@@ -5,6 +5,55 @@ episodes as Foxglove MCAP for training (crossformer). Everything through pilot
 verification is DONE and committed on branch `synthetic-lift-mcap`. Your job is the
 scale-up and its verification. Read this whole file before running anything.
 
+## 2026-07-15: remote CrossFormer lift evaluation findings (`dagger`)
+
+Use `dagger` commit `43632c3` or newer for remote policy evaluation. In
+`src/xsim/eval_policy.py`, `RemotePolicy.act()` now buffers the model's returned
+action chunk and executes one row per control tick. The default open-loop horizon is
+50, so server queries occur at episode steps 0, 50, 100, and so on. The older behavior
+re-queried every tick and executed only row 0, producing severe jitter and invalidating
+the earlier 0-success runs. `--action.open-loop-h 1` intentionally restores that
+legacy behavior for an A/B test; do not use it for the normal evaluation.
+
+Two checkpoints were evaluated on the identical 10 x 10 lift grid with one repetition,
+20-second episodes, Nyx rendering, and an MP4 for every trial. The learned policy was
+served remotely; these were not scripted-policy runs.
+
+- `/home/grifflee/checkpoints/0715_still-star-1213/params`, step 100000:
+  **40/100 success**; 59 `never_lifted`, 1 `dropped_in_transit`.
+  Results are in
+  `outputs/eval/0715_still-star-1213_step100000_100trials/`.
+- `/data/store/weights/0707_iconic-spaceship-1191/params`, step 50000:
+  **3/100 success**; 96 `never_lifted`, 1 `dropped_in_transit`.
+  Results are in
+  `outputs/eval/0707_iconic-spaceship-1191_step50000_100trials/`.
+- The explicitly labeled side-by-side and delta plot is
+  `outputs/eval/model_comparison_0715_vs_0707.png`. Each run has 100 JSONL records
+  and 100 MP4s under its `videos/` directory.
+
+Heatmap/table alignment: the robot is at x=0 and faces toward increasing x. The
+heatmap's left edge (x=0.35) is near the robot and its right edge (x=0.58) is far.
+Standing behind the robot and looking toward +x, the bottom edge (y=-0.15) is the
+robot's right and the top edge (y=+0.15) is its left. Thus bottom-left means
+near-robot/robot-right; top-left means near-robot/robot-left.
+
+Both servers repeatedly warned that `kp3dc_robot` and `kp3dw_robot` proprio inputs
+were absent and masked. This remains a train/serve mismatch, so the model comparison
+is fair under the same serving contract, but neither result establishes the ceiling
+with training-time keypoints supplied. Investigate client-side FK keypoints or use
+`server_compare.py` before blaming weights alone.
+
+For this evaluation workflow, grifflee requested **9xxx ports only**. Port 9001 was
+used on loopback with `--host 127.0.0.1 --port 9001 --no-viser`; all evaluation and
+server processes were stopped afterward. Always verify and close listeners when done.
+
+Seed ranges: DAgger generation runs use base seed 61000 with the per-scene formula
+`base + rep*10007 + grid_idx` (rep 0: 61000-61099, rep 1: 71007-71106, rep 2:
+81014-81113, ...), all clear of training (9k/20k/30k+) and eval (51k) ranges. Corrected episodes are kept only when their release-trimmed
+length is at most `--max-training-frames` (default 450 = 2x the 227-frame demo max,
+grifflee's decision 2026-07-16); longer corrected hybrids are counted as
+`corrected_too_long` and never written as training MCAP.
+
 ## 0. IN PROGRESS (2026-07-02 evening) -- new demonstration protocol verified through pilot
 
 Commit `660d33b` introduced grifflee's new protocol; this follow-up made the validation

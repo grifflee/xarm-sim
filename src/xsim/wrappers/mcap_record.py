@@ -68,6 +68,11 @@ class McapRecordWrapper(Wrapper):
         return self._last_render if self._last_render is not None else self.env.render()
 
     # -- keep/drop API --
+    @property
+    def trimmed_frames(self) -> int:
+        """Frames save() would keep (release trim applied), without writing anything."""
+        return self._trim_index() if self._steps else 0
+
     def save(self, path: str | Path) -> dict:
         """Write the buffered episode as a training MCAP; returns {"frames": n}."""
         from xsim.mcap_writer import CameraSpec, EpisodeMcapWriter
