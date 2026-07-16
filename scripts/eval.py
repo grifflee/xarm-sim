@@ -149,7 +149,8 @@ def build_env(cfg: Config) -> GymEnv:
         TaskEnv(cfg.env), control_every=control_every,
         max_control_steps=cfg.max_control_steps if cfg.time_limit else None)
     if cfg.video_every > 0:
-        out = cfg.out if cfg.out is not None else PROJECT_ROOT / "outputs" / "eval" / cfg.task
+        # default output on /data/store (separate disk): repo-local outputs/ fills the root fs
+        out = cfg.out if cfg.out is not None else Path("/data/store/griffen_sim_mcaps/evals") / cfg.task
         # video wraps the raw env so it captures every physics step, then chunking wraps that
         env = VideoRecordWrapper(
             env, out / "videos",

@@ -47,6 +47,17 @@ For this evaluation workflow, grifflee requested **9xxx ports only**. Port 9001 
 used on loopback with `--host 127.0.0.1 --port 9001 --no-viser`; all evaluation and
 server processes were stopped afterward. Always verify and close listeners when done.
 
+**Output locations (2026-07-16, grifflee):** all bulk run output belongs on
+`/data/store` (a separate disk) — never under `~/repo/xarm-sim/outputs`, which sits on
+the root filesystem and must not fill up. The script defaults now enforce this:
+
+- eval runs -> `/data/store/griffen_sim_mcaps/evals/` (`eval_grid.py`, `eval.py`)
+- dagger diagnostics (videos/results) -> `/data/store/griffen_sim_mcaps/dagger_runs/`
+- dagger training MCAP -> `/data/store/griffen_sim_mcaps/dagger_mcaps/` (unchanged)
+
+Pre-existing runs under `~/repo/xarm-sim/outputs/` remain there for now; paths cited
+elsewhere in this file predate the move.
+
 Seed ranges: DAgger generation runs use base seed 61000 with the per-scene formula
 `base + rep*10007 + grid_idx` (rep 0: 61000-61099, rep 1: 71007-71106, rep 2:
 81014-81113, ...), all clear of training (9k/20k/30k+) and eval (51k) ranges. Corrected episodes are kept only when their release-trimmed

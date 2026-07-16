@@ -590,7 +590,8 @@ def _build_policy(env: TaskEnv, cfg: Config):
 
 def main(cfg: Config) -> None:
     cfg.env.task = cfg.task  # single --task flag drives both env and policy
-    resolved_out = cfg.out if cfg.out is not None else PROJECT_ROOT / "outputs" / "eval" / cfg.task
+    # default output on /data/store (separate disk): repo-local outputs/ fills the root fs
+    resolved_out = cfg.out if cfg.out is not None else Path("/data/store/griffen_sim_mcaps/evals") / cfg.task
     resolved_out.mkdir(parents=True, exist_ok=True)
     results_path = resolved_out / "results.jsonl"
 

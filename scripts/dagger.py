@@ -285,7 +285,8 @@ def main(cfg: Config) -> None:
         points, _, _ = build_grid(cfg.task, cfg.grid_nx, cfg.grid_ny, x_range, y_range)
 
     generation_run = _generation_run(cfg, len(points))
-    default_out_root = PROJECT_ROOT / "outputs" / "dagger"
+    # diagnostics (videos/results) also default to /data/store (separate disk from ~)
+    default_out_root = Path("/data/store/griffen_sim_mcaps/dagger_runs")
     out = cfg.out if cfg.out is not None else _run_dir(default_out_root, model, cfg, generation_run)
     mcap_run_dir = (_run_dir(cfg.mcap_dir, model, cfg, generation_run)
                     if cfg.mcap_dir is not None else None)
