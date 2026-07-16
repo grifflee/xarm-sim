@@ -81,6 +81,9 @@ class Config:
     # only the cells the evaluated model did not solve, i.e. exactly the learning gaps.
     cells_from: Path | None = None
     cells: Literal["failed", "all"] = "failed"
+    # Pilot subsetting: keep only N of the selected cells, stride-sampled across the
+    # grid_idx order so a small pilot still spans the failure map.
+    cells_limit: int | None = None
     cube_yaw: float = 0.0
     perturb_xy: float = 0.05           # cube-position lie (m) for --student perturbed
     # Hybrid budgets. max_control_steps caps the ROLLOUT (student segment + takeover
@@ -274,6 +277,8 @@ def main(cfg: Config) -> None:
 
     if cfg.cells_from is not None:
         points = _cells_from_eval(cfg.cells_from, cfg.cells)
+        if cfg.cells_limit is not None and cfg.cells_limit < len(points):
+            points = points[:: max(1, len(points) // cfg.cells_limit)][: cfg.cells_limit]
         print(f"cells: {len(points)} {cfg.cells} cells from {cfg.cells_from}")
     else:
         x_range, y_range = grid_ranges(cfg, cfg.env)
