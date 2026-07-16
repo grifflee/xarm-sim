@@ -90,7 +90,11 @@ class Config:
     stack_z_tol: float = 0.008        # max |z error| (m) from ideal stacked height
     # noslip_iterations defaults to 10 here (TaskEnvCfg's own default is 0): weld-free
     # friction grasping needs it or the cube creeps down the fingers. Override on the CLI.
-    env: TaskEnvCfg = field(default_factory=lambda: TaskEnvCfg(noslip_iterations=10))
+    # nyx is REQUIRED for any remote-policy eval: the model is trained on nyx images
+    # (splat background, colored robot); raster frames are out-of-domain and invalidate
+    # the numbers. Same default as scripts/dagger.py — never rely on a CLI flag for this.
+    env: TaskEnvCfg = field(default_factory=lambda: TaskEnvCfg(
+        noslip_iterations=10, render_backend="nyx"))
     obs: ObsSpec = field(default_factory=ObsSpec)        # remote-policy obs mapping
     action: ActionSpec = field(default_factory=ActionSpec)  # remote-policy action mapping
 
