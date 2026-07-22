@@ -98,10 +98,9 @@ def target_mesh() -> trimesh.Trimesh:
         extents=(table.size_xy[0], table.size_xy[1], SLAB_HEIGHT),
         transform=tf((table.center_xy[0], table.center_xy[1], table.top_z - SLAB_HEIGHT / 2)),
     )
-    plate_h = max(-table.top_z, 0.004)  # plate top flush with the robot-base origin
     plate = trimesh.creation.box(
-        extents=(decor.plate_size_xy[0], decor.plate_size_xy[1], plate_h),
-        transform=tf((decor.plate_center_xy[0], decor.plate_center_xy[1], -plate_h / 2)),
+        extents=decor.plate_size,
+        transform=tf((*decor.plate_center_xy, -decor.plate_size[2] / 2)),
     )
     base = trimesh.load(PROJECT_ROOT / "assets" / "link_base.stl")
     link1 = trimesh.load(PROJECT_ROOT / "assets" / "link1.stl")

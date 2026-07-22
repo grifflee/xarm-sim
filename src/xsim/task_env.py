@@ -181,10 +181,8 @@ XARM7_ROBOT_CFG: dict = {
     "gripper_link_names": ["left_finger", "right_finger"],
     "arm_dof_dim": 7,
     "gripper_dof_dim": 6,
-    # low ready pose matching the real demos' start (TCP ≈ (0.34, 0, 0.10), top-down) —
-    # IK-solved; the old high home (TCP z=0.29) gave episodes a different opening style
-    # than the real recordings (see compare_batches report)
-    "default_arm_dof": [math.radians(v) for v in [0.0, -26.2, 0.0, 13.5, 0.0, 25.0, 90.0]],
+    # Upstream home; the retired low-ready pose was outside the DAgger distribution.
+    "default_arm_dof": [math.radians(v) for v in [0.0, -45.0, 0.0, 35.0, 0.0, 65.0, 90.0]],
     # xArm gripper joint convention (verified by finger separation): 0.0 = open (fingers
     # apart), 0.85 = hard fully closed. For a 31.75 mm cube, command a tighter
     # task grasp target instead of the hard stop; this holds the block without
@@ -196,7 +194,7 @@ XARM7_ROBOT_CFG: dict = {
     # the extra squeeze; 0.53 matches the real reading exactly and drops the cube)
     "gripper_grasp_dof": 0.58,
     "dofs_kp": [4500, 4500, 3500, 3500, 2000, 2000, 2000, 350, 350, 350, 350, 350, 350],
-    "dofs_kv": [450, 450, 350, 350, 200, 200, 200, 35, 35, 35, 35, 35, 35],
+    "dofs_kv": [135, 135, 105, 105, 60, 60, 60, 35, 35, 35, 35, 35, 35],
     "dofs_force_lower": [-50] * 13,
     "dofs_force_upper": [50] * 13,
     "ik_method": "dls_ik",
@@ -344,7 +342,7 @@ class TableCfg:
     # center measured by inverse-perspective-mapping the calibrated cap.npz photos onto
     # the table plane (robot base at one end of the table); size is the real cart's
     # 3 ft x 2 ft top (grifflee) — the IPM estimate read (0.93, 0.62)
-    center_xy: tuple[float, float] = (0.375, 0.01)
+    center_xy: tuple[float, float] = (0.3937, 0.0)
     size_xy: tuple[float, float] = (0.9144, 0.6096)
     color: tuple[float, float, float] = (0.13, 0.14, 0.17)  # dark slate like the real cart
 
@@ -365,9 +363,9 @@ class BaseDecorCfg:
     # centered on the base (grifflee): along x (away from the table edge) it is only as
     # long as the base's outer ring (~13 cm); along y (toward the cameras/wall) it
     # sticks out ~1 inch past the ring on each side, just enough for the blue clamps.
-    plate_size_xy: tuple[float, float] = (0.13, 0.18)
+    plate_size: tuple[float, float, float] = (0.127, 0.2032, 0.01)
     plate_center_xy: tuple[float, float] = (0.0, 0.0)
-    plate_color: tuple[float, float, float] = (0.55, 0.55, 0.58)
+    plate_color: tuple[float, float, float] = (0.62, 0.63, 0.65)
 
 
 @dataclass
@@ -419,8 +417,8 @@ class TaskEnvCfg:
     # None preserves Genesis' default robot collision import. Set to 0.0 to force
     # convex decomposition of robot meshes instead of coarse per-mesh hulls.
     robot_decompose_robot_error_threshold: float | None = None
-    rectangle_x: tuple[float, float] = (0.35, 0.58)   # cube spawn range (m)
-    rectangle_y: tuple[float, float] = (-0.15, 0.15)
+    rectangle_x: tuple[float, float] = (0.20, 0.40)   # cube spawn range (m)
+    rectangle_y: tuple[float, float] = (-0.288, 0.288)
     # drop target: "middle of the table" — x sampled per episode, y fixed on the centerline.
     # The release happens at the transport height (no lowering); the cube free-falls.
     drop_x_range: tuple[float, float] = (0.30, 0.40)
@@ -552,11 +550,10 @@ class TaskEnv:
 
         d = self.cfg.base_decor
         if d.enabled and not (self.cfg.splat_bg and self.cfg.render_backend == "raster"):
-            plate_h = max(-t.top_z, 0.004)  # plate top flush with the robot-base origin
             self.scene.add_entity(
                 gs.morphs.Box(
-                    size=(*d.plate_size_xy, plate_h),
-                    pos=(*d.plate_center_xy, t.top_z + plate_h / 2.0),
+                    size=d.plate_size,
+                    pos=(*d.plate_center_xy, -d.plate_size[2] / 2.0),
                     fixed=True,
                     visualization=True,
                     collision=False,
