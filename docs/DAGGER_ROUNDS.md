@@ -16,11 +16,15 @@ expert, and appends those labels into one growing dataset that the next model tr
 - **Seed range 61000+** is reserved for dagger collection (`--seed`, default `61000`),
   clear of training and of the eval base seed (51000). Bump the base if a round needs
   >1000 episodes; do not overlap eval seeds.
-- **Rendering stays `nyx`** (splat background, colored robot). Raster frames are
-  out-of-domain for the student and silently invalidate the data. This is the default in
-  both scripts and must never be relied on via a bare CLI flag. HARD RULE: before any real
-  collection, verify the *effective* config against the **last valid run's summary.json**
-  (`env.render_backend`, `noslip_iterations`, `close_setpoint`) — not the script defaults.
+- **Rendering uses the composite gsplat renderer, consistently**: Genesis foregrounds
+  over the baked gsplat background. Before any real collection, verify the *effective*
+  render config against the **last valid run's summary/manifest** (`env.render_backend`,
+  `env.splat_bg`, `env.splat_uri`, `camera_mode`, `noslip_iterations`, `close_setpoint`).
+- **Foreground parity exception:** upstream uses Madrona, but the locked wheel currently
+  hard-aborts while linking BVH kernels in this single-env environment, so Genesis raster
+  is the explicit fallback. A future batching project must visually revalidate before
+  changing that backend; splat, geometry, and camera decisions remain unchanged.
+- **Round 0 is the new lineage's base-data regeneration**, not an incremental DAgger add-on.
 - Data lands under `/data/store/griffen_sim_mcaps/` (dagger MCAPs in `dagger_mcaps/`,
   diagnostics in `dagger_runs/`, evals in `evals/`). Never write to repo-local `outputs/`.
 
@@ -34,7 +38,7 @@ skip this step; treat success ≐ 0.)
 
 ```bash
 uv run python scripts/eval_grid.py --task lift --policy remote \
-    --host localhost --port 8001 --env.render-backend nyx --backend gpu --video-every 10
+    --host localhost --port 8001 --backend gpu --video-every 10
 # -> /data/store/griffen_sim_mcaps/evals/lift/summary.json
 ```
 
@@ -113,7 +117,8 @@ Round 0 uses β = 1.0 (pure teacher). Two safety terms, each a scar from a real 
   rebuild reprocesses every image for a few percent of new data and risks renumbering.
 - **Do not mix into `xarm_sim`.** Dagger data is its own dataset (`xarm_sim_dagger`) with
   its own stats.
-- **Do not swap the render backend to raster** for speed — it invalidates the round.
+- **Do not change the effective composite render configuration** mid-lineage; do not
+  disable `splat_bg`, switch back to Nyx, or change foreground shading without a new visual gate.
 
 ## Troubleshooting
 

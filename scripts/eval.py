@@ -115,11 +115,9 @@ class Config:
     # sim-time to reach each waypoint (at the cost of playing the trajectory slower).
     sim_hz: int = 120
     control_hz: int = 30
-    # nyx is REQUIRED for any remote-policy eval: the model is trained on nyx images
-    # (splat background, colored robot); raster frames are out-of-domain and invalidate
-    # the numbers. Same default as scripts/dagger.py — never rely on a CLI flag for this.
+    # Keep remote evaluation on the same Genesis-over-gsplat composite as collection.
     env: TaskEnvCfg = field(default_factory=lambda: TaskEnvCfg(
-        noslip_iterations=10, render_backend="nyx"))
+        noslip_iterations=10, render_backend="raster", splat_bg=True))
 
 
 def build_env(cfg: Config) -> GymEnv:

@@ -11,13 +11,13 @@ The policy is either a crossformer served over the webpolicy websocket (``--poli
 or one of the repo's scripted waypoint policies run **weld-free** (``--policy scripted``, a
 validation baseline). Both are driven through the uniform adapters in ``xsim.eval_policy``.
 
-    # scripted baseline smoke test (fast raster backend, tiny grid):
+    # scripted baseline smoke test on the model-facing composite, tiny grid:
     uv run python scripts/eval_grid.py --task lift --policy scripted \
-        --env.render-backend raster --grid-nx 3 --grid-ny 3 --reps 1 --backend gpu
-    # real eval of a served model (grainlike/bela serving stack) on the nyx domain;
+        --grid-nx 3 --grid-ny 3 --reps 1 --backend gpu
+    # real eval of a served model on the same composite domain;
     # obs/action defaults match that server so no extra flags are needed:
     uv run python scripts/eval_grid.py --task lift --policy remote --host localhost \
-        --port 8001 --env.render-backend nyx --backend gpu --video-every 10
+        --port 8001 --backend gpu --video-every 10
 
 Grasping runs weld-free and requires the noslip post-pass (``--env.noslip-iterations``,
 defaulted to 10 here) or the cube creeps down the fingers; the closed-finger setpoint
@@ -90,11 +90,9 @@ class Config:
     stack_z_tol: float = 0.008        # max |z error| (m) from ideal stacked height
     # noslip_iterations defaults to 10 here (TaskEnvCfg's own default is 0): weld-free
     # friction grasping needs it or the cube creeps down the fingers. Override on the CLI.
-    # nyx is REQUIRED for any remote-policy eval: the model is trained on nyx images
-    # (splat background, colored robot); raster frames are out-of-domain and invalidate
-    # the numbers. Same default as scripts/dagger.py — never rely on a CLI flag for this.
+    # Keep remote evaluation on the same Genesis-over-gsplat composite as collection.
     env: TaskEnvCfg = field(default_factory=lambda: TaskEnvCfg(
-        noslip_iterations=10, render_backend="nyx"))
+        noslip_iterations=10, render_backend="raster", splat_bg=True))
     obs: ObsSpec = field(default_factory=ObsSpec)        # remote-policy obs mapping
     action: ActionSpec = field(default_factory=ActionSpec)  # remote-policy action mapping
 

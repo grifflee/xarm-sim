@@ -93,10 +93,9 @@ class Config:
     model_name: str | None = None
     dagger_version: str = "paper-v1"
     generation_run: str | None = None
-    # nyx rendering is REQUIRED for training data: the student was trained on nyx images
-    # (splat background, colored robot); raster frames are out-of-domain for it.
+    # New-lineage model data always uses Genesis foregrounds composited over gsplat.
     env: TaskEnvCfg = field(default_factory=lambda: TaskEnvCfg(
-        noslip_iterations=10, render_backend="nyx"))
+        noslip_iterations=10, render_backend="raster", splat_bg=True))
 
 
 # ---------------------------------------------------------------------------------------
