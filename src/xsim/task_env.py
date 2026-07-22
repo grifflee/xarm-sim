@@ -434,6 +434,10 @@ class TaskEnvCfg:
     table_mode: Literal["slab", "plane"] = "slab"  # plane = visible infinite tabletop, no finite cart slab
     table_transparent: bool = True         # baked splat supplies table pixels; collision stays live
     show_viewer: bool = False
+    # Upstream shades foreground geometry with the Madrona raytracer. The
+    # currently locked wheel hard-aborts while linking its BVH kernels, so this
+    # single-env path explicitly falls back to Genesis raster. A future batched
+    # generator must revalidate this visual boundary before changing backends.
     render_backend: Literal["raster", "nyx"] = "raster"
     splat_bg: bool = True
     splat_uri: Path | None = DEFAULT_SPLAT_PATH
