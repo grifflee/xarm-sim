@@ -29,7 +29,7 @@ import gs_nyx.nyx_py_sdk as nps
 from gs_nyx_plugin.nyx_camera_options import NyxCameraOptions
 
 from xsim.grasp_env import Manipulator, ROBOT_VISUAL_MATERIALS, _robot_material_name, _set_vgeom_surface
-from xsim.splat_bg import SplatAsset, SplatBackground, T_GL_TO_CV, invert_rigid
+from xsim.splat_bg import SplatAsset, SplatBackground, T_GL_TO_CV, invert_rigid, viewmats_cv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROBOT_URDF_PATH = PROJECT_ROOT / "xarm7_standalone.urdf"
@@ -46,11 +46,6 @@ DEFAULT_NYX_CEILING_LIGHT_Z = 1.85
 DEFAULT_NYX_CEILING_TARGET_X = (0.28, 0.55)
 DEFAULT_NYX_CEILING_TARGET_Y = (-0.12, 0.12)
 ROBOT_BASE_ROUGHNESS = {"White": 0.28, "Black": 0.35, "Aluminum": 0.22}
-
-def _rot_from_rpy_deg(roll: float, pitch: float, yaw: float) -> np.ndarray:
-    x, y, z, w = quat_xyzw_from_rpy_deg(roll, pitch, yaw)
-    return _quat_wxyz_to_rot((w, x, y, z))
-
 
 def _unit(v) -> np.ndarray:
     arr = np.asarray(v, dtype=np.float64)
@@ -204,6 +199,182 @@ XARM7_ROBOT_CFG: dict = {
 }
 
 
+@dataclass(frozen=True)
+class CamSampler:
+    """Description of a camera pose distribution sampled at reset."""
+
+    name: str
+    fov_deg: float | None = None
+    up: tuple[float, float, float] = (0.0, 0.0, 1.0)
+    attach_link: str | None = None
+    resample_on_reset: bool = True
+
+    def sample(
+        self, rng: np.random.Generator, n: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True, kw_only=True)
+class MountSampler(CamSampler):
+    """Randomized wrist mount in the attached link frame."""
+
+    apex: tuple[float, float, float]
+    axis: tuple[float, float, float]
+    center_r: float = 0.11
+    pos_r_across: float = 0.04
+    pos_r_along: float = 0.02
+    lookat_center: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    lookat_across: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    lookat_radius: float = 0.04
+
+    def sample(
+        self, rng: np.random.Generator, n: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        axis = np.asarray(self.axis, dtype=np.float64)
+        axis /= np.linalg.norm(axis)
+        u = np.array([0.0, 0.0, 1.0])
+        u = u - (u @ axis) * axis
+        if np.linalg.norm(u) < 1e-9:
+            u = np.array([1.0, 0.0, 0.0])
+        u /= np.linalg.norm(u)
+        v = np.cross(axis, u)
+
+        b = rng.normal(size=(n, 3))
+        b /= np.linalg.norm(b, axis=1, keepdims=True)
+        b *= np.cbrt(rng.uniform(size=(n, 1)))
+        center = np.asarray(self.apex) + self.center_r * axis
+        pos = center + np.outer(self.pos_r_along * b[:, 0], axis) + self.pos_r_across * (
+            np.outer(b[:, 1], u) + np.outer(b[:, 2], v)
+        )
+
+        across = np.asarray(self.lookat_across, dtype=np.float64)
+        across = across - (across @ axis) * axis
+        across /= np.linalg.norm(across)
+        rl, a = self.lookat_radius, self.center_r
+        s = np.empty(n)
+        t = np.empty(n)
+        filled = 0
+        while filled < n:
+            m = max(2 * (n - filled), 256)
+            samples = rng.uniform([-rl, -rl], [a, rl], size=(m, 2))
+            keep = np.where(
+                samples[:, 0] >= 0,
+                (samples[:, 0] / a) ** 2 + (samples[:, 1] / rl) ** 2 <= 1.0,
+                samples[:, 0] ** 2 + samples[:, 1] ** 2 <= rl**2,
+            )
+            samples = samples[keep]
+            take = min(len(samples), n - filled)
+            s[filled : filled + take] = samples[:take, 0]
+            t[filled : filled + take] = samples[:take, 1]
+            filled += take
+        lookat = np.asarray(self.lookat_center) + s[:, None] * axis + t[:, None] * across
+        return pos, lookat, np.tile(np.asarray(self.up, dtype=np.float64), (n, 1))
+
+
+@dataclass(frozen=True, kw_only=True)
+class BallLookatSampler(CamSampler):
+    """Positions in a solid ball around a calibrated camera; lookats in a box."""
+
+    center: tuple[float, float, float]
+    radius: float
+    lookat_lo: tuple[float, float, float]
+    lookat_hi: tuple[float, float, float]
+    min_elevation_deg: float = 8.0
+
+    def sample(
+        self, rng: np.random.Generator, n: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        center = np.asarray(self.center, dtype=np.float64)
+        la_lo = np.asarray(self.lookat_lo, dtype=np.float64)
+        la_hi = np.asarray(self.lookat_hi, dtype=np.float64)
+        pos = np.empty((n, 3))
+        lookat = np.empty((n, 3))
+        filled = 0
+        while filled < n:
+            m = max(2 * (n - filled), 256)
+            b = rng.normal(size=(m, 3))
+            b /= np.linalg.norm(b, axis=1, keepdims=True)
+            b *= np.cbrt(rng.uniform(size=(m, 1)))
+            p = center + self.radius * b
+            la = rng.uniform(la_lo, la_hi, size=(m, 3))
+            direction = p - la
+            elev = np.degrees(np.arcsin(direction[:, 2] / np.linalg.norm(direction, axis=1)))
+            keep = elev >= self.min_elevation_deg
+            p, la = p[keep], la[keep]
+            take = min(len(p), n - filled)
+            pos[filled : filled + take] = p[:take]
+            lookat[filled : filled + take] = la[:take]
+            filled += take
+        up = np.tile(np.asarray(self.up, dtype=np.float64), (n, 1))
+        return pos, lookat, up
+
+
+@dataclass(frozen=True, kw_only=True)
+class ShellLookatSampler(CamSampler):
+    """Positions in a chopped-sphere shell; lookats in a workspace box."""
+
+    radius: float
+    x_range: tuple[float, float]
+    z_range: tuple[float, float]
+    inner_scale: float | None = 0.5
+    lookat_lo: tuple[float, float, float]
+    lookat_hi: tuple[float, float, float]
+    min_elevation_deg: float = 8.0
+
+    def _inside(self, p: np.ndarray, scale: float) -> np.ndarray:
+        radius = scale * self.radius
+        x_lo, x_hi = (scale * bound for bound in self.x_range)
+        z_lo, z_hi = (scale * bound for bound in self.z_range)
+        return (
+            (np.linalg.norm(p, axis=1) <= radius)
+            & (p[:, 0] >= x_lo)
+            & (p[:, 0] <= x_hi)
+            & (p[:, 2] >= z_lo)
+            & (p[:, 2] <= z_hi)
+        )
+
+    def sample(
+        self, rng: np.random.Generator, n: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        lo = np.array(
+            [
+                max(-self.radius, self.x_range[0]),
+                -self.radius,
+                max(-self.radius, self.z_range[0]),
+            ]
+        )
+        hi = np.array(
+            [
+                min(self.radius, self.x_range[1]),
+                self.radius,
+                min(self.radius, self.z_range[1]),
+            ]
+        )
+        la_lo = np.asarray(self.lookat_lo, dtype=np.float64)
+        la_hi = np.asarray(self.lookat_hi, dtype=np.float64)
+        pos = np.empty((n, 3))
+        lookat = np.empty((n, 3))
+        filled = 0
+        while filled < n:
+            m = max(2 * (n - filled), 256)
+            p = rng.uniform(lo, hi, size=(m, 3))
+            la = rng.uniform(la_lo, la_hi, size=(m, 3))
+            keep = self._inside(p, 1.0)
+            if self.inner_scale is not None:
+                keep &= ~self._inside(p, self.inner_scale)
+            direction = p - la
+            elev = np.degrees(np.arcsin(direction[:, 2] / np.linalg.norm(direction, axis=1)))
+            keep &= elev >= self.min_elevation_deg
+            p, la = p[keep], la[keep]
+            take = min(len(p), n - filled)
+            pos[filled : filled + take] = p[:take]
+            lookat[filled : filled + take] = la[:take]
+            filled += take
+        up = np.tile(np.asarray(self.up, dtype=np.float64), (n, 1))
+        return pos, lookat, up
+
+
 @dataclass
 class CameraView:
     """Placement for one camera. Static cams use pos/lookat; the wrist cam attaches to a link."""
@@ -291,6 +462,16 @@ DEFAULT_CAMERAS: tuple[CameraView, ...] = (
         attach_offset=_look_offset_T(back=0.14, side=0.085, lift=-0.03, pitch_deg=-5.0, yaw_deg=25.0, roll_deg=-90.0),
     ),
 )
+WRIST_MOUNT_SAMPLER = MountSampler(
+    name="wrist",
+    fov_deg=REALSENSE_FOV_DEG,
+    attach_link="link_tcp",
+    up=tuple(float(DEFAULT_CAMERAS[2].attach_offset[row][1]) for row in range(3)),
+    apex=(0.0, 0.0, -0.172),
+    axis=(1.0, 0.0, 0.0),
+)
+
+
 
 
 # Splat (lab.ply) → world alignment, solved 2026-07-01 by scripts/align_ransac.py:
@@ -474,13 +655,8 @@ class TaskEnvCfg:
     cube_hue_jitter_deg: float = 0.0
     cube_value_jitter: float = 0.0           # multiplicative +/- fraction in HSV value
     appearance_seed: int | None = None       # set by the generator for reproducible appearance samples
-    # per-episode camera jitter, applied in reset() around the calibrated nominal poses
-    # (the nominals themselves never move); the actual sampled poses are exposed via
-    # episode_extrinsics so batch manifests can record them. 0 = off.
-    cam_jitter_deg: float = 0.0    # low/side: ± per-axis rpy, in the camera frame (deg)
-    cam_jitter_cm: float = 0.0     # low/side: ± per-axis world xyz (cm)
-    wrist_jitter_deg: float = 0.0  # wrist mount offset: ± per-axis rpy (deg)
-    wrist_jitter_cm: float = 0.0   # wrist mount offset: ± per-axis xyz (cm)
+    # Per-reset pose distribution; names, FOVs, resolution, and topics stay fixed.
+    camera_mode: Literal["fixed", "ball", "shell"] = "shell"
 
 
 class TaskEnv:
@@ -877,42 +1053,65 @@ class TaskEnv:
         """Cube yaw (rad) sampled at reset; used to align the grasp to the cube faces."""
         return self._cube_yaw
 
-    def _randomize_cameras(self, rng: np.random.Generator) -> None:
-        """Per-episode camera jitter around the nominal poses; records actual extrinsics.
+    def _camera_lookat_bounds(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        return (
+            (self.cfg.rectangle_x[0], self.cfg.rectangle_y[0], self.cfg.table.top_z + 0.01),
+            (self.cfg.rectangle_x[1], self.cfg.rectangle_y[1], self.cfg.table.top_z + 0.20),
+        )
 
-        Static cams get an orientation delta (± cam_jitter_deg per rpy axis, applied in
-        the camera frame) and a world-frame position delta (± cam_jitter_cm per axis).
-        The wrist mount offset gets the same treatment in its own frame when wrist jitter
-        is enabled. ``episode_extrinsics`` then holds camera(optical CV)→world for static
-        cams — the same convention as LOW_C2W_CV/SIDE_C2W_CV — and link_tcp→camera
-        (optical CV) under ``wrist_mount``.
-        """
+    def _static_camera_sampler(self, view: CameraView) -> CamSampler:
+        lookat_lo, lookat_hi = self._camera_lookat_bounds()
+        if self.cfg.camera_mode == "ball":
+            return BallLookatSampler(
+                name=view.name,
+                fov_deg=view.fov_deg,
+                center=view.pos,
+                radius=0.10,
+                lookat_lo=lookat_lo,
+                lookat_hi=lookat_hi,
+            )
+        if self.cfg.camera_mode == "shell":
+            positions = [np.asarray(v.pos) for v in self.camera_views if v.attach_link is None]
+            return ShellLookatSampler(
+                name=view.name,
+                fov_deg=view.fov_deg,
+                radius=1.1 * max(float(np.linalg.norm(pos)) for pos in positions),
+                x_range=(-0.3048, max(float(pos[0]) for pos in positions)),
+                z_range=(self.cfg.table.top_z, max(float(pos[2]) for pos in positions)),
+                lookat_lo=lookat_lo,
+                lookat_hi=lookat_hi,
+            )
+        raise ValueError(f"unknown camera_mode: {self.cfg.camera_mode!r}")
+
+    def _randomize_cameras(self, rng: np.random.Generator) -> None:
+        """Sample camera poses and record their actual OpenCV extrinsics."""
         self.episode_extrinsics = {}
         for view in self.camera_views:
             cam = self.cams[view.name]
             if view.attach_link is None:
-                c2w = self._nominal_c2w_gl[view.name].copy()
-                d_rpy = rng.uniform(-1.0, 1.0, 3) * self.cfg.cam_jitter_deg
-                d_xyz = rng.uniform(-1.0, 1.0, 3) * (self.cfg.cam_jitter_cm / 100.0)
-                c2w[:3, :3] = c2w[:3, :3] @ _rot_from_rpy_deg(*d_rpy)
-                c2w[:3, 3] += d_xyz
-                pos = tuple(c2w[:3, 3])
-                lookat = tuple(c2w[:3, 3] - c2w[:3, 2])
-                up = tuple(c2w[:3, 1])
-                if hasattr(cam, "set_pose"):
-                    cam.set_pose(pos=pos, lookat=lookat, up=up)
+                if self.cfg.camera_mode == "fixed":
+                    c2w_gl = self._nominal_c2w_gl[view.name].copy()
+                    pos = c2w_gl[:3, 3]
+                    lookat = pos - c2w_gl[:3, 2]
+                    up = c2w_gl[:3, 1]
+                    c2w_cv = c2w_gl @ T_GL_TO_CV
                 else:
-                    cam.update_camera_pose(pos=pos, lookat=lookat, up=up)
-                self.episode_extrinsics[view.name] = c2w @ T_GL_TO_CV
+                    pos_b, lookat_b, up_b = self._static_camera_sampler(view).sample(rng, 1)
+                    pos, lookat, up = pos_b[0], lookat_b[0], up_b[0]
+                    c2w_cv = invert_rigid(viewmats_cv(pos, lookat, up))[0]
+                if hasattr(cam, "set_pose"):
+                    cam.set_pose(pos=tuple(pos), lookat=tuple(lookat), up=tuple(up))
+                else:
+                    cam.update_camera_pose(pos=tuple(pos), lookat=tuple(lookat), up=tuple(up))
+                self.episode_extrinsics[view.name] = c2w_cv
             else:
-                offset = np.asarray(view.attach_offset, dtype=np.float64).copy()
-                if self.cfg.wrist_jitter_deg or self.cfg.wrist_jitter_cm:
-                    delta = np.eye(4)
-                    delta[:3, :3] = _rot_from_rpy_deg(*(rng.uniform(-1.0, 1.0, 3) * self.cfg.wrist_jitter_deg))
-                    delta[:3, 3] = rng.uniform(-1.0, 1.0, 3) * (self.cfg.wrist_jitter_cm / 100.0)
-                    offset = offset @ delta
-                    if view.name in self._rig_attached_camera_names:
-                        cam.attach(self._attach_links[view.name], offset)
+                if self.cfg.camera_mode == "fixed":
+                    offset = np.asarray(view.attach_offset, dtype=np.float64).copy()
+                else:
+                    pos, lookat, up = WRIST_MOUNT_SAMPLER.sample(rng, 1)
+                    offset = (invert_rigid(viewmats_cv(pos, lookat, up)) @ T_GL_TO_CV)[0]
+                if view.name in self._rig_attached_camera_names:
+                    cam.attach(self._attach_links[view.name], offset)
                 self._attach_offsets[view.name] = offset
                 self.episode_extrinsics[f"{view.name}_mount"] = offset @ T_GL_TO_CV
 
