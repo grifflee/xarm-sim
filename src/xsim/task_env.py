@@ -502,17 +502,20 @@ def splat_world_transform(pos=DEFAULT_SPLAT_POS, quat=DEFAULT_SPLAT_QUAT, scale=
 def _apply_robot_shine(robot_entity, roughness_scale: float) -> None:
     """Rebind robot visual surfaces with scaled roughness; lower roughness = shinier."""
     roughness_scale = float(np.clip(roughness_scale, 0.2, 3.0))
-    surfaces = {
-        name: gs.surfaces.BSDF(
-            color=ROBOT_VISUAL_MATERIALS[name][:3],
-            metallic=1.0 if name == "Aluminum" else 0.0,
-            roughness=float(np.clip(ROBOT_BASE_ROUGHNESS[name] * roughness_scale, 0.02, 0.95)),
-        )
-        for name in ROBOT_BASE_ROUGHNESS
-    }
     for vgeom in robot_entity.vgeoms:
         material_name = _robot_material_name(vgeom.link.name)
-        _set_vgeom_surface(vgeom, surfaces[material_name], ROBOT_VISUAL_MATERIALS[material_name])
+        # Genesis raster caches one pyrender material per Surface identity. Reusing a
+        # Surface across STL-backed links preserves the first mesh's vertex colour but
+        # drops it from later meshes, which turned most of the black gripper white.
+        # Distinct, equivalent surfaces keep every link's assigned URDF colour.
+        surface = gs.surfaces.BSDF(
+            color=ROBOT_VISUAL_MATERIALS[material_name][:3],
+            metallic=1.0 if material_name == "Aluminum" else 0.0,
+            roughness=float(
+                np.clip(ROBOT_BASE_ROUGHNESS[material_name] * roughness_scale, 0.02, 0.95)
+            ),
+        )
+        _set_vgeom_surface(vgeom, surface, ROBOT_VISUAL_MATERIALS[material_name])
 
 
 @dataclass
@@ -725,7 +728,7 @@ class TaskEnv:
             raise ValueError(f"unknown table_mode: {self.cfg.table_mode!r}")
 
         d = self.cfg.base_decor
-        if d.enabled and not (self.cfg.splat_bg and self.cfg.render_backend == "raster"):
+        if d.enabled:
             self.scene.add_entity(
                 gs.morphs.Box(
                     size=d.plate_size,
@@ -734,7 +737,7 @@ class TaskEnv:
                     visualization=True,
                     collision=False,
                 ),
-                surface=gs.surfaces.Plastic(color=d.plate_color, roughness=0.35),
+                surface=gs.surfaces.Plastic(color=d.plate_color, roughness=0.6),
             )
 
         # robot (base at world origin, on the table top)
