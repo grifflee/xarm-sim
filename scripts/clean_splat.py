@@ -58,9 +58,46 @@ RAW_SCAN_SOLVE = dict(
 
 # standard 3DGS PLY layout: x y z nx ny nz f_dc(3) f_rest(45) opacity scale(3) rot(4)
 _XYZ = slice(0, 3)
+_F_DC = slice(6, 9)
 _F_REST = slice(9, 54)
+_OPACITY = 54
 _SCALE = slice(55, 58)
 _ROT = slice(58, 62)  # wxyz
+
+# Synthetic tabletop plate (reverse-engineered from upstream's released assets-v1
+# lab_aligned.ply, which is NOT reproducible from upstream's committed scripts alone):
+# the scanned tabletop rasterizes as gray mush, so the surface band is deleted and
+# replaced with a uniform grid of flat gaussians — the splat-space equivalent of a
+# clean visual slab, renderer-agnostic because it rasterizes with everything else.
+# All constants measured from the released asset: grid 228x152 centered on the table,
+# pitch == xy sigma (tiles seamlessly), sunk 1 cm below the physical tabletop, 1 mm
+# thin, identity rotation, opacity sigmoid(6)~0.998, uniform bluish gray.
+PLATE_GRID = (228, 152)
+PLATE_PITCH = float(np.exp(-5.563525))  # == xy log-scale below -> ~3.83 mm
+PLATE_Z_BELOW_TOP = 0.01
+PLATE_F_DC = (-0.62135345, -0.62102026, -0.48242748)  # rgb ~ (0.325, 0.325, 0.364)
+PLATE_OPACITY = 6.0
+PLATE_LOG_SCALE = (-5.563525, -5.563525, -6.9077554)
+PLATE_JITTER = 1e-6  # break exact coplanarity (z-fighting in the rasterizer)
+
+
+def make_table_plate(table, n_props: int) -> np.ndarray:
+    """Rows (N, n_props) for the synthetic tabletop plate, in vertex-column layout."""
+    nx, ny = PLATE_GRID
+    cx, cy = table.center_xy
+    xs = cx + (np.arange(nx) - (nx - 1) / 2.0) * PLATE_PITCH
+    ys = cy + (np.arange(ny) - (ny - 1) / 2.0) * PLATE_PITCH
+    gx, gy = np.meshgrid(xs, ys, indexing="ij")
+    rows = np.zeros((nx * ny, n_props), dtype=np.float32)
+    rows[:, _XYZ] = np.stack(
+        [gx.ravel(), gy.ravel(), np.full(nx * ny, table.top_z - PLATE_Z_BELOW_TOP)], axis=-1
+    )
+    rows[:, _XYZ] += np.random.default_rng(0).uniform(0, PLATE_JITTER, (nx * ny, 3))
+    rows[:, _F_DC] = PLATE_F_DC
+    rows[:, _OPACITY] = PLATE_OPACITY
+    rows[:, _SCALE] = PLATE_LOG_SCALE
+    rows[:, _ROT] = (1.0, 0.0, 0.0, 0.0)
+    return rows
 
 
 def rot_from_quat_xyzw(q) -> np.ndarray:
@@ -120,6 +157,9 @@ class Cfg:
     # SH extrapolates into streak garbage (and baking the alignment rotation into
     # SH>0 isn't implemented)
     flatten_sh: bool = True
+    # replace the scanned tabletop mush with the synthetic uniform plate (default
+    # mode only; keep-table mode preserves the real scanned surface instead)
+    table_plate: bool = True
 
 
 def main(c: Cfg) -> None:
@@ -210,13 +250,31 @@ def main(c: Cfg) -> None:
         kept_vol = float(np.mean(a * r**2)) if len(idx) else 1.0
 
     giant = np.exp(data[:, _SCALE]).max(axis=1) > c.max_radius
-    kept = data[~(inside | giant)].copy()
+    surface = np.zeros(n, dtype=bool)
+    plate = None
+    if c.table_plate and not c.keep_table:
+        # clear the residual scanned fuzz between the plate plane and the crop plane
+        # (the crop box starts AT the tabletop, so near-surface mush below it survives
+        # and would float above the plate), then lay the synthetic plate.
+        z_plate = table.top_z - PLATE_Z_BELOW_TOP
+        half = np.array([PLATE_GRID[0], PLATE_GRID[1]]) * PLATE_PITCH / 2 + 0.01
+        surface = (
+            (np.abs(pw[:, 0] - table.center_xy[0]) < half[0])
+            & (np.abs(pw[:, 1] - table.center_xy[1]) < half[1])
+            & (pw[:, 2] > z_plate - 0.005)
+            & (pw[:, 2] <= c.z_range[0])
+        )
+        plate = make_table_plate(table, data.shape[1])
+    kept = data[~(inside | giant | surface)].copy()
     if c.flatten_sh:
         kept[:, _F_REST] = 0.0
+    if plate is not None:
+        kept = np.concatenate([kept, plate])
     print(
         f"{n} gaussians: {inside.sum()} {inside_label}, {shrink.sum()} squashed at the "
         f"boundary (mean {100 * kept_vol:.0f}% volume kept), {giant.sum()} giant, "
-        f"keeping {len(kept)}"
+        f"{surface.sum()} surface fuzz cleared, "
+        f"+{0 if plate is None else len(plate)} synthetic plate, keeping {len(kept)}"
     )
 
     new_header = header.replace(f"element vertex {n}", f"element vertex {len(kept)}")
