@@ -229,6 +229,12 @@ class LiftExpertPolicy:
         grasp_quat = np.asarray(_nearest_side_grasp_quat(cube_yaw, ee_quat), dtype=np.float64)
         quat_cmd = _slerp(ee_quat, grasp_quat, self.rot_frac)
 
+        # Cartesian command that produced this label, stashed for teacher-channel
+        # recording (see mcap_writer /teacher/robot_states): pos in metres (xyz),
+        # quat wxyz. float64 to match the measured ee_pose the writer scales.
+        self.last_pos_cmd = np.asarray(pos_cmd, dtype=np.float64)
+        self.last_quat_cmd = np.asarray(quat_cmd, dtype=np.float64)
+
         joints = self._ik_joints(pos_cmd, quat_cmd)
         return np.concatenate([joints, [grip]]).astype(np.float32)
 

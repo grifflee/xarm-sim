@@ -206,6 +206,12 @@ class EpisodeMcapWriter:
         self._joints: JointStatesChannel | None = None
         self._robot_states: PoseChannel | None = None
         self._gripper = None
+        # Optional /teacher/* channels mirroring the measured ones. Created lazily on the
+        # first step that supplies teacher data, so an episode without teacher labels
+        # never instantiates them and writes byte-identical MCAPs to today.
+        self._teacher_joints: JointStatesChannel | None = None
+        self._teacher_robot_states: PoseChannel | None = None
+        self._teacher_gripper = None
 
     def __enter__(self) -> "EpisodeMcapWriter":
         self._mcap = foxglove.open_mcap(self.path, allow_overwrite=self._allow_overwrite)
@@ -278,11 +284,21 @@ class EpisodeMcapWriter:
         extrinsics: dict[str, np.ndarray] | None,
         ee_pose: np.ndarray,
         gripper_norm: float,
+        teacher_joint_pos: np.ndarray | None = None,
+        teacher_ee_pose: np.ndarray | None = None,
+        teacher_gripper_norm: float | None = None,
     ) -> None:
         """Log one recorded timestep.
 
         images[name] is RGB uint8[H,W,3]. ee_pose is [x,y,z,qw,qx,qy,qz] in metres.
         Real xArm MCAP Pose positions are in millimetres, so TCP xyz is scaled by 1000.
+
+        When teacher data is supplied (all three teacher_* args), three parallel channels
+        record the expert's label for DAgger — ``/teacher/joint_states`` (7 commanded joint
+        targets, zero velocity/effort), ``/teacher/robot_states`` (commanded EE pose, same
+        x1000 m->mm scaling as ``/xarm/robot_states``; teacher_ee_pose is [x,y,z,qw,qx,qy,qz]
+        in metres) and ``/teacher/gripper`` (commanded norm, 1=open/0=closed). Omit them and
+        the MCAP is byte-identical to a measured-only recording.
         """
         ts = _timestamp(stamp_ns)
 
@@ -328,3 +344,34 @@ class EpisodeMcapWriter:
         )
 
         self._gripper.log(encode_gripper(int(stamp_ns), float(gripper_norm)), log_time=int(stamp_ns))
+
+        has_teacher = (
+            teacher_joint_pos is not None
+            and teacher_ee_pose is not None
+            and teacher_gripper_norm is not None
+        )
+        if not has_teacher:
+            return
+        if self._teacher_joints is None:  # lazy: first teacher step creates the channels
+            self._teacher_joints = JointStatesChannel("/teacher/joint_states")
+            self._teacher_robot_states = PoseChannel("/teacher/robot_states")
+            self._teacher_gripper = foxglove.Channel(
+                "/teacher/gripper", schema=GRIPPER_SCHEMA, message_encoding="protobuf")
+
+        t_joints = [
+            JointState(name=n, position=float(p), velocity=0.0, effort=0.0)
+            for n, p in zip(self.joint_names, np.asarray(teacher_joint_pos).reshape(-1), strict=True)
+        ]
+        self._teacher_joints.log(JointStates(timestamp=ts, joints=t_joints), log_time=int(stamp_ns))
+
+        tpx, tpy, tpz, tqw, tqx, tqy, tqz = (float(v) for v in np.asarray(teacher_ee_pose).reshape(-1))
+        self._teacher_robot_states.log(
+            Pose(
+                position=Vector3(x=tpx * 1000.0, y=tpy * 1000.0, z=tpz * 1000.0),
+                orientation=Quaternion(x=tqx, y=tqy, z=tqz, w=tqw),
+            ),
+            log_time=int(stamp_ns),
+        )
+
+        self._teacher_gripper.log(
+            encode_gripper(int(stamp_ns), float(teacher_gripper_norm)), log_time=int(stamp_ns))

@@ -31,18 +31,43 @@ from xsim.wrappers.base import Wrapper
 
 
 class McapRecordWrapper(Wrapper):
-    def __init__(self, env: Any, record_dt: float, release_tail_steps: int = 9):
+    def __init__(self, env: Any, record_dt: float, release_tail_steps: int = 9,
+                 keep_all: bool = False):
         super().__init__(env)
         self.record_dt = record_dt
         self.release_tail_steps = release_tail_steps
+        # keep_all bypasses the release trim so DAgger episodes save full length
+        # (paper-DAgger keeps every visited state, including post-release/failure ones).
+        self.keep_all = keep_all
         self.enabled = True
         self._steps: list[dict] = []
         self._last_render: dict[str, np.ndarray] | None = None
+        self._pending_teacher: dict | None = None
 
     def reset(self, **kwargs) -> Any:
         self._steps = []
         self._last_render = None
+        self._pending_teacher = None
         return self.env.reset(**kwargs)
+
+    def set_teacher(self, joints7, pos_cmd, quat_cmd, grip_norm) -> None:
+        """Attach the expert's label to the NEXT recorded step (call before ``step``).
+
+        joints7: 7 commanded arm-joint targets. pos_cmd/quat_cmd: commanded EE pose (xyz
+        metres, wxyz). grip_norm: commanded gripper (1=open/0=closed). ``joints7=None``
+        omits the teacher channels for the step. The label is consumed by the following
+        ``step`` and reset to None, so a step with no ``set_teacher`` records no teacher data.
+        """
+        if joints7 is None:
+            self._pending_teacher = None
+            return
+        pos = np.asarray(pos_cmd, dtype=np.float64).reshape(-1)[:3]
+        quat = np.asarray(quat_cmd, dtype=np.float64).reshape(-1)[:4]
+        self._pending_teacher = dict(
+            joint_pos=np.asarray(joints7, dtype=np.float64).reshape(-1)[:7].copy(),
+            ee_pose=np.concatenate([pos, quat]).copy(),  # [x,y,z,qw,qx,qy,qz]
+            gripper_norm=float(grip_norm),
+        )
 
     def step(self, action: Any) -> tuple[Any, float, bool, dict]:
         obs, reward, done, info = self.env.step(action)
@@ -59,9 +84,11 @@ class McapRecordWrapper(Wrapper):
                 ee_pose=np.asarray(ee, dtype=np.float64).reshape(-1)[:7].copy(),
                 gripper_norm=float(self.env.gripper_norm()),
                 gripper_open_cmd=_gripper_open(action),
+                teacher=self._pending_teacher,
             ))
         else:
             self._last_render = None
+        self._pending_teacher = None
         return obs, reward, done, info
 
     def render(self) -> dict:
@@ -70,8 +97,10 @@ class McapRecordWrapper(Wrapper):
     # -- keep/drop API --
     @property
     def trimmed_frames(self) -> int:
-        """Frames save() would keep (release trim applied), without writing anything."""
-        return self._trim_index() if self._steps else 0
+        """Frames save() would keep, without writing anything (full length under keep_all)."""
+        if not self._steps:
+            return 0
+        return len(self._steps) if self.keep_all else self._trim_index()
 
     def save(self, path: str | Path) -> dict:
         """Write the buffered episode as a training MCAP; returns {"frames": n}."""
@@ -79,7 +108,7 @@ class McapRecordWrapper(Wrapper):
 
         if not self._steps:
             raise ValueError("McapRecordWrapper.save called with an empty buffer")
-        steps = self._steps[: self._trim_index()]
+        steps = self._steps if self.keep_all else self._steps[: self._trim_index()]
 
         specs = {}
         for name, (w, h, fx, fy, cx, cy) in self.env.camera_specs().items():
@@ -90,10 +119,14 @@ class McapRecordWrapper(Wrapper):
         with EpisodeMcapWriter(path, specs) as writer:
             writer.log_calibration(base_ns, self.env.episode_extrinsics)
             for i, s in enumerate(steps):
+                t = s.get("teacher")
                 writer.log_step(
                     base_ns + i * record_dt_ns, s["images"],
                     s["joint_pos"], s["joint_vel"], s["joint_eff"], None,
                     ee_pose=s["ee_pose"], gripper_norm=s["gripper_norm"],
+                    teacher_joint_pos=(t["joint_pos"] if t else None),
+                    teacher_ee_pose=(t["ee_pose"] if t else None),
+                    teacher_gripper_norm=(t["gripper_norm"] if t else None),
                 )
         self.discard()
         return {"frames": len(steps)}
