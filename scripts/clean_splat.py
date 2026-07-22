@@ -1,14 +1,28 @@
-"""Clean the lab splat for sim rendering.
+"""Bake the solved alignment into the lab splat and crop the table volume.
 
-Default mode crops the table volume out of the raw lab splat. The real cart's dark
-reflective top scans as sparse see-through mush, and the scan also bakes in the robot
-itself. Both live inside the table volume in world coordinates, and both fight the sim's
-own mesh robot / tabletop slab when rendering.
+Transforms every gaussian by the committed splat->world solve (so the output PLY
+is world-frame: load it with an identity splat pose), then cleans the table
+region. Two modes:
 
-``--keep-table`` keeps the scanned cart/table and under-table region, while removing
-above-table clutter/baked robot points from the same footprint. Use that with
-``--env.table-transparent`` when the desired view is the real splat table without the sim
-mesh slab.
+Default: empties an axis-aligned box over the table (z from just below the
+tabletop to 3 ft above, xy the table footprint plus margin), removing the
+scanned (ghost) robot, cube and tabletop fuzz that fight the sim's own meshes.
+Gaussians whose center is outside the box but whose volume pokes in are not
+dropped or shrunk uniformly (that thins the table surface into holes) — each is
+replaced by the largest spheroid contained in the original gaussian that stays
+outside the box: squashed only along the offending box axis, with the center
+pushed away from the face when that preserves more volume. Solved per gaussian
+in the whitened frame, where the optimum depends only on the clearance/extent
+ratio. Writes ``assets/lab_aligned.ply``.
+
+``--keep-table``: keeps the scanned cart/table and under-table region, removing
+only above-table clutter/baked robot points from the same footprint. Use that
+with ``--env.table-transparent`` when the desired view is the real splat table
+without the sim mesh slab. Writes ``assets/lab_aligned_w_table.ply``.
+
+Both outputs are world-frame — load with splat_pos=(0,0,0),
+splat_quat=(0,0,0,1), splat_scale=1.0 (the fork's nyx light-field loader still
+applies its z-up->y-up conversion to that identity pose, matching the meshes).
 
     uv run python scripts/clean_splat.py
     uv run python scripts/clean_splat.py --keep-table
@@ -24,33 +38,87 @@ import numpy as np
 import tyro
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CLEAN_SPLAT = PROJECT_ROOT / "assets" / "lab_clean.ply"
-DEFAULT_CLEAN_W_TABLE_SPLAT = PROJECT_ROOT / "assets" / "lab_clean_w_table.ply"
+DEFAULT_ALIGNED_SPLAT = PROJECT_ROOT / "assets" / "lab_aligned.ply"
+DEFAULT_ALIGNED_W_TABLE_SPLAT = PROJECT_ROOT / "assets" / "lab_aligned_w_table.ply"
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from xsim.task_env import splat_world_transform  # noqa: E402
+from xsim.task_env import BaseDecorCfg, TableCfg  # noqa: E402  (task-generic module)
+
+# splat->world solve for the raw lab scan: align_ransac.py seed refined by
+# scripts/icp_splat.py. Copied literally from xsim.task_env DEFAULT_SPLAT_*
+# (2026-07-22); UPDATE from icp_splat.py's printed "after" pose and re-bake.
+# Kept local (not imported live) on purpose: once lab_aligned.ply is the loaded
+# splat, task_env's DEFAULT_SPLAT_* becomes the identity pose, so reading them
+# here would bake a no-op. Semantics: p_world = scale * R(quat_xyzw) * p + pos.
+RAW_SCAN_SOLVE = dict(
+    pos=(-0.2237, 0.7717, 0.1711),
+    quat_xyzw=(-0.501119, 0.487918, -0.50087, 0.509849),
+    scale=0.9966,
+)
+
+# standard 3DGS PLY layout: x y z nx ny nz f_dc(3) f_rest(45) opacity scale(3) rot(4)
+_XYZ = slice(0, 3)
+_F_REST = slice(9, 54)
+_SCALE = slice(55, 58)
+_ROT = slice(58, 62)  # wxyz
+
+
+def rot_from_quat_xyzw(q) -> np.ndarray:
+    x, y, z, w = np.asarray(q, dtype=np.float64)
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+def rots_from_quat_wxyz(q: np.ndarray) -> np.ndarray:
+    """(B, 4) wxyz -> (B, 3, 3)."""
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    return np.stack(
+        [
+            np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1),
+            np.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1),
+            np.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1),
+        ],
+        axis=-2,
+    )
+
+
+def quat_mul_wxyz(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton product; q1 is (4,), q2 is (N, 4), both wxyz."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+    return np.stack(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        axis=-1,
+    )
 
 
 @dataclass
 class Cfg:
-    src: Path = Path("/data/store/lab.ply")
-    dst: Path = DEFAULT_CLEAN_SPLAT
+    src: Path = Path("/data/store/lab.ply")  # the full raw lab scan (scan frame)
+    dst: Path = DEFAULT_ALIGNED_SPLAT
     keep_table: bool = False
-    # world-frame crop box: the table footprint with generous margin (gaussians are
-    # volumes — blobs centered outside a tight box still splat across the tabletop),
-    # from just below the top over the baked robot's full reach. Also swallows the
-    # rig hardware standing on the table (clamps, low-camera pole).
-    box_min: tuple[float, float, float] = (-0.30, -0.55, -0.75)
-    box_max: tuple[float, float, float] = (1.15, 0.75, 1.30)
-    # In keep-table mode, preserve the scanned cart/table and under-table region, but
+    # default-mode crop box: tabletop to 3 ft above it, xy = table footprint + margin
+    z_range: tuple[float, float] = (-0.01, 0.9144)
+    xy_margin: float = 0.10  # fraction of the table half-extents
+    sigma: float = 2.0  # support radius (in sigmas) used for the boundary reach test
+    # keep-table mode: preserve the scanned cart/table and under-table region, but
     # remove baked robot/clamps/poles sitting above the tabletop inside the footprint.
     keep_table_remove_above_z: float = 0.04
-    # also drop giant haze/floater gaussians: semi-transparent blobs with metre-scale
-    # extents that smear across the whole scene (real surfaces use small gaussians)
+    # also drop giant haze/floater gaussians: metre-scale semi-transparent smears
     max_radius: float = 0.10
-    # zero the view-dependent SH terms: the sim cameras sit inside the scene at angles
-    # far outside the scan trajectory, where degree-3 SH extrapolates into white/black
-    # streak garbage; DC-only colours are stable from every angle
+    # DC-only colour: sim cameras sit far off the scan trajectory where higher-order
+    # SH extrapolates into streak garbage (and baking the alignment rotation into
+    # SH>0 isn't implemented)
     flatten_sh: bool = True
 
 
@@ -60,29 +128,96 @@ def main(c: Cfg) -> None:
     header = raw[:end].decode()
     n = int(next(ln for ln in header.splitlines() if ln.startswith("element vertex")).split()[-1])
     props = sum(1 for ln in header.splitlines() if ln.startswith("property "))
-    data = np.frombuffer(raw[end:], dtype=np.float32).reshape(n, props)
+    data = np.frombuffer(raw[end:], dtype=np.float32).reshape(n, props).copy()
 
-    T = splat_world_transform()
-    pw = data[:, :3].astype(np.float64) @ T[:3, :3].T + T[:3, 3]
+    # bake the solved splat->world alignment into positions and rotations
+    pos = np.asarray(RAW_SCAN_SOLVE["pos"], dtype=np.float64)
+    quat_xyzw = RAW_SCAN_SOLVE["quat_xyzw"]
+    scale = float(RAW_SCAN_SOLVE["scale"])
+    R = rot_from_quat_xyzw(quat_xyzw)
+    data[:, _XYZ] = (scale * data[:, _XYZ].astype(np.float64) @ R.T + pos).astype(np.float32)
+    qx, qy, qz, qw = quat_xyzw
+    q = data[:, _ROT].astype(np.float64)
+    q /= np.linalg.norm(q, axis=-1, keepdims=True)
+    data[:, _ROT] = quat_mul_wxyz(np.array([qw, qx, qy, qz]), q).astype(np.float32)
+    data[:, _SCALE] += np.log(scale)
 
-    lo, hi = np.asarray(c.box_min), np.asarray(c.box_max)
+    # table footprint box (world frame), from the fork's TableCfg
+    table = TableCfg()
+    hx, hy = (1 + c.xy_margin) * np.asarray(table.size_xy) / 2
+    lo = np.array([table.center_xy[0] - hx, table.center_xy[1] - hy, c.z_range[0]])
+    hi = np.array([table.center_xy[0] + hx, table.center_xy[1] + hy, c.z_range[1]])
+    pw = data[:, _XYZ].astype(np.float64)
+
     if c.keep_table:
+        # keep cart/table + under-table; drop only above-table clutter in the footprint
         inside_xy = np.all((pw[:, :2] >= lo[:2]) & (pw[:, :2] <= hi[:2]), axis=1)
         inside = inside_xy & (pw[:, 2] > c.keep_table_remove_above_z) & (pw[:, 2] <= hi[2])
         inside_label = "above-table clutter"
-        dst = DEFAULT_CLEAN_W_TABLE_SPLAT if c.dst == DEFAULT_CLEAN_SPLAT else c.dst
+        shrink = np.zeros(n, dtype=bool)  # no boundary squash: we keep the table surface
+        kept_vol = 1.0
+        dst = DEFAULT_ALIGNED_W_TABLE_SPLAT if c.dst == DEFAULT_ALIGNED_SPLAT else c.dst
     else:
         inside = np.all((pw >= lo) & (pw <= hi), axis=1)
         inside_label = "in the table box"
         dst = c.dst
 
-    # scale_0..2 (log) sit right after opacity, which is the property before them
-    giant = np.exp(data[:, 55:58]).max(axis=1) > c.max_radius
-    drop = inside | giant
-    kept = data[~drop].copy()
+        # boundary gaussians: center outside, but sigma-support reaches the box.
+        # world half-extent along axis i is sigma * ||B[i, :]|| for B = R_g diag(s);
+        # the gaussian is separated from the box iff extent < clearance on an axis
+        # where the center is out. For the rest, work in the whitened frame (old
+        # ellipsoid -> unit ball, box face -> plane at distance d = clear/extent):
+        # replace the ball with the max-volume spheroid inside both the ball and the
+        # half-space — semi-axis a along the whitened face normal w, r perp, center
+        # shifted t away from the face. a = d + t makes the face constraint tight, and
+        # containment in the unit ball gives r(t) in closed form; the best t is a 1-D
+        # search shared across gaussians.
+        clear = np.maximum(np.maximum(lo - pw, pw - hi), 0.0)
+        B = rots_from_quat_wxyz(data[:, _ROT].astype(np.float64)) * np.exp(
+            data[:, _SCALE].astype(np.float64)
+        )[:, None, :]
+        extent = c.sigma * np.linalg.norm(B, axis=-1)
+        ratio = np.where(clear > 0, clear / extent, -np.inf).max(axis=1)
+        shrink = ~inside & (ratio < 1.0)
+
+        idx = np.flatnonzero(shrink)
+        k = np.argmax(np.where(clear[idx] > 0, clear[idx] / extent[idx], -np.inf), axis=1)
+        d = ratio[idx]
+        sign = np.where(pw[idx, k] < lo[k], 1.0, -1.0)  # toward-box direction is sign * e_k
+        Btn = B[idx, k, :] * sign[:, None]  # B^T (sign e_k): rows of B
+        w = Btn / np.linalg.norm(Btn, axis=-1, keepdims=True)
+
+        grid = np.linspace(0.0, 1.0, 65)
+        t = grid[None, :] * ((1.0 - d) / 2.0)[:, None]  # a + t <= 1 keeps the ball bound
+        a = d[:, None] + t
+        c1 = 1.0 - t**2 - a**2
+        beta = (c1 + np.sqrt(np.maximum(c1**2 - 4.0 * a**2 * t**2, 0.0))) / 2.0
+        r2 = a**2 + beta
+        best = np.argmax(a * r2, axis=1)
+        ar = np.arange(len(idx))
+        t, a, r = t[ar, best], a[ar, best], np.sqrt(r2[ar, best])
+
+        Bw = np.einsum("mij,mj->mi", B[idx], w)
+        data[idx, _XYZ] -= ((c.sigma * t)[:, None] * Bw).astype(np.float32)
+        # B' = B (r I + (a - r) w w^T): squash along w, full extent elsewhere
+        Bp = r[:, None, None] * B[idx] + (a - r)[:, None, None] * Bw[:, :, None] * w[:, None, :]
+        evals, evecs = np.linalg.eigh(Bp @ Bp.transpose(0, 2, 1))
+        data[idx, _SCALE] = np.log(np.sqrt(np.maximum(evals, 1e-18))).astype(np.float32)
+        evecs[:, :, 0] *= np.sign(np.linalg.det(evecs))[:, None]  # rotations, not reflections
+        from scipy.spatial.transform import Rotation
+
+        data[idx, _ROT] = Rotation.from_matrix(evecs).as_quat()[:, [3, 0, 1, 2]].astype(np.float32)
+        kept_vol = float(np.mean(a * r**2)) if len(idx) else 1.0
+
+    giant = np.exp(data[:, _SCALE]).max(axis=1) > c.max_radius
+    kept = data[~(inside | giant)].copy()
     if c.flatten_sh:
-        kept[:, 9:54] = 0.0  # f_rest_0..44
-    print(f"{n} gaussians: {inside.sum()} {inside_label}, {giant.sum()} giant, keeping {len(kept)}")
+        kept[:, _F_REST] = 0.0
+    print(
+        f"{n} gaussians: {inside.sum()} {inside_label}, {shrink.sum()} squashed at the "
+        f"boundary (mean {100 * kept_vol:.0f}% volume kept), {giant.sum()} giant, "
+        f"keeping {len(kept)}"
+    )
 
     new_header = header.replace(f"element vertex {n}", f"element vertex {len(kept)}")
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -90,6 +225,7 @@ def main(c: Cfg) -> None:
         f.write(new_header.encode())
         kept.astype(np.float32).tofile(f)
     print(f"wrote {dst} ({dst.stat().st_size / 1e6:.0f} MB)")
+    print("output is world-frame: load with splat_pos=(0,0,0), splat_quat=(0,0,0,1), splat_scale=1.0")
 
 
 if __name__ == "__main__":
