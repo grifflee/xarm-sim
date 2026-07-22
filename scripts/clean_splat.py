@@ -51,8 +51,8 @@ from xsim.task_env import BaseDecorCfg, TableCfg  # noqa: E402  (task-generic mo
 # splat, task_env's DEFAULT_SPLAT_* becomes the identity pose, so reading them
 # here would bake a no-op. Semantics: p_world = scale * R(quat_xyzw) * p + pos.
 RAW_SCAN_SOLVE = dict(
-    pos=(-0.2237, 0.7717, 0.1711),
-    quat_xyzw=(-0.501119, 0.487918, -0.50087, 0.509849),
+    pos=(-0.2088, 0.7866, 0.1831),
+    quat_xyzw=(-0.517954, 0.490916, -0.489502, 0.501112),
     scale=0.9966,
 )
 
