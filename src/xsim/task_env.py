@@ -29,13 +29,13 @@ import gs_nyx.nyx_py_sdk as nps
 from gs_nyx_plugin.nyx_camera_options import NyxCameraOptions
 
 from xsim.grasp_env import Manipulator, ROBOT_VISUAL_MATERIALS, _robot_material_name, _set_vgeom_surface
+from xsim.splat_bg import SplatAsset, SplatBackground, T_GL_TO_CV, invert_rigid
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROBOT_URDF_PATH = PROJECT_ROOT / "xarm7_standalone.urdf"
-# cleaned copy (scripts/clean_splat.py strips the see-through table mush + baked robot);
-# fall back to the raw scan if it hasn't been generated
-_CLEAN_SPLAT = PROJECT_ROOT / "assets" / "lab_clean.ply"
-DEFAULT_SPLAT_PATH = _CLEAN_SPLAT if _CLEAN_SPLAT.exists() else Path("/data/store/lab.ply")
+# World-frame splat baked by scripts/clean_splat.py. TaskEnv fails early if
+# this prerequisite is absent instead of silently changing the visual domain.
+DEFAULT_SPLAT_PATH = PROJECT_ROOT / "assets" / "lab_aligned.ply"
 
 BLOCK_SIZE = 0.03175  # 1.25 inch cube edge (m)
 BLOCK_COLOR = (0.48, 0.05, 0.04)  # saturated red; brighter albedos wash to salmon under the nyx light
@@ -46,10 +46,6 @@ DEFAULT_NYX_CEILING_LIGHT_Z = 1.85
 DEFAULT_NYX_CEILING_TARGET_X = (0.28, 0.55)
 DEFAULT_NYX_CEILING_TARGET_Y = (-0.12, 0.12)
 ROBOT_BASE_ROUGHNESS = {"White": 0.28, "Black": 0.35, "Aluminum": 0.22}
-
-# OpenGL camera (x right, y up, -z forward) → OpenCV optical (x right, y down, +z forward).
-_T_GL_TO_CV = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]], dtype=np.float64)
-
 
 def _rot_from_rpy_deg(roll: float, pitch: float, yaw: float) -> np.ndarray:
     x, y, z, w = quat_xyzw_from_rpy_deg(roll, pitch, yaw)
@@ -436,14 +432,18 @@ class TaskEnvCfg:
     table: TableCfg = field(default_factory=TableCfg)
     base_decor: BaseDecorCfg = field(default_factory=BaseDecorCfg)
     table_mode: Literal["slab", "plane"] = "slab"  # plane = visible infinite tabletop, no finite cart slab
-    table_transparent: bool = False        # hide the visual table slab while keeping table collision
+    table_transparent: bool = True         # baked splat supplies table pixels; collision stays live
     show_viewer: bool = False
     render_backend: Literal["raster", "nyx"] = "raster"
+    splat_bg: bool = True
     splat_uri: Path | None = DEFAULT_SPLAT_PATH
-    splat_pos: tuple[float, float, float] | None = DEFAULT_SPLAT_POS
+    splat_pos: tuple[float, float, float] | None = (0.0, 0.0, 0.0)
     splat_rot_rpy_deg: tuple[float, float, float] | None = None
-    splat_quat: tuple[float, float, float, float] = DEFAULT_SPLAT_QUAT
-    splat_scale: float | None = DEFAULT_SPLAT_SCALE
+    splat_quat: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+    splat_scale: float | None = 1.0
+    splat_chunk: int = 256
+    splat_prune_opacity: float = 0.15
+    splat_resplat_every: int = 3
     nyx_spp: int = 8
     nyx_light_type: Literal["directional", "ceiling_panel"] = "directional"
     nyx_light_dir: tuple[float, float, float] = DEFAULT_NYX_LIGHT_DIR
@@ -520,7 +520,7 @@ class TaskEnv:
         self.table = self.scene.add_entity(
             gs.morphs.Plane(
                 pos=(0.0, 0.0, t.top_z),
-                visualization=self.cfg.table_mode == "plane",
+                visualization=self.cfg.table_mode == "plane" and not self.cfg.table_transparent,
                 collision=True,
             ),
             surface=table_surface,
@@ -547,7 +547,7 @@ class TaskEnv:
             raise ValueError(f"unknown table_mode: {self.cfg.table_mode!r}")
 
         d = self.cfg.base_decor
-        if d.enabled:
+        if d.enabled and not (self.cfg.splat_bg and self.cfg.render_backend == "raster"):
             plate_h = max(-t.top_z, 0.004)  # plate top flush with the robot-base origin
             self.scene.add_entity(
                 gs.morphs.Box(
@@ -584,6 +584,9 @@ class TaskEnv:
         self.cams = {}
         self._manual_attached_cams = []
         self._rig_attached_camera_names = set()
+        self._splat_renderer: SplatBackground | None = None
+        self._splat_bg_frames: dict[str, np.ndarray] = {}
+        self._splat_steps = 0
         self._add_cameras()
 
         self.scene.build(n_envs=1)
@@ -615,6 +618,7 @@ class TaskEnv:
             elif hasattr(cam, "set_pose"):
                 cam.set_pose(pos=view.pos, lookat=view.lookat, up=view.up)
 
+        self._setup_splat_bg()
         self.reset()
 
     def _sample_appearance(self, seed: int | None) -> dict:
@@ -683,6 +687,32 @@ class TaskEnv:
         if self.cfg.splat_rot_rpy_deg is not None:
             rotation = quat_xyzw_from_rpy_deg(*self.cfg.splat_rot_rpy_deg)
         return (_make_light_field(splat_uri, self.cfg.splat_pos, rotation, self.cfg.splat_scale),)
+
+    def _setup_splat_bg(self) -> None:
+        if not self.cfg.splat_bg or self.cfg.render_backend == "nyx":
+            return
+        if self.cfg.splat_uri is None:
+            raise ValueError("splat_bg=True requires splat_uri")
+        splat_uri = Path(self.cfg.splat_uri).expanduser()
+        if not splat_uri.exists():
+            raise FileNotFoundError(f"splat file does not exist: {splat_uri}")
+        if self.cfg.splat_pos is None or self.cfg.splat_scale is None:
+            raise ValueError("composite splats require explicit pos and scale")
+        rotation = self.cfg.splat_quat
+        if self.cfg.splat_rot_rpy_deg is not None:
+            rotation = quat_xyzw_from_rpy_deg(*self.cfg.splat_rot_rpy_deg)
+        asset = SplatAsset(
+            uri=splat_uri,
+            pos=self.cfg.splat_pos,
+            quat_xyzw=rotation,
+            scale=self.cfg.splat_scale,
+        )
+        self._splat_renderer = SplatBackground(
+            asset,
+            device=str(self.device),
+            chunk=self.cfg.splat_chunk,
+            prune_opacity=self.cfg.splat_prune_opacity,
+        )
 
     def _add_cameras(self) -> None:
         if self.cfg.render_backend == "nyx":
@@ -821,6 +851,8 @@ class TaskEnv:
         # below sees the jittered pose
         self.robot.reset(envs_idx=None, skip_forward=False, arm_qpos_offset=arm_offset)
         self._sync_attached_cams()
+        self._splat_steps = 0
+        self._render_splat_bg()
 
     # -- grasp weld: while gripped, the cube must not be able to slip (grifflee) --
     def grasp_lock(self) -> None:
@@ -870,7 +902,7 @@ class TaskEnv:
                     cam.set_pose(pos=pos, lookat=lookat, up=up)
                 else:
                     cam.update_camera_pose(pos=pos, lookat=lookat, up=up)
-                self.episode_extrinsics[view.name] = c2w @ _T_GL_TO_CV
+                self.episode_extrinsics[view.name] = c2w @ T_GL_TO_CV
             else:
                 offset = np.asarray(view.attach_offset, dtype=np.float64).copy()
                 if self.cfg.wrist_jitter_deg or self.cfg.wrist_jitter_cm:
@@ -881,11 +913,16 @@ class TaskEnv:
                     if view.name in self._rig_attached_camera_names:
                         cam.attach(self._attach_links[view.name], offset)
                 self._attach_offsets[view.name] = offset
-                self.episode_extrinsics[f"{view.name}_mount"] = offset @ _T_GL_TO_CV
+                self.episode_extrinsics[f"{view.name}_mount"] = offset @ T_GL_TO_CV
 
     def step(self) -> None:
         self.scene.step()
         self._sync_attached_cams()
+        if self._splat_renderer is not None and self.cfg.splat_resplat_every > 0:
+            self._splat_steps += 1
+            if self._splat_steps % self.cfg.splat_resplat_every == 0:
+                moving = [v.name for v in self.camera_views if v.attach_link is not None]
+                self._render_splat_bg(moving)
 
     def _sync_attached_cams(self) -> None:
         for view in self.camera_views:
@@ -899,20 +936,61 @@ class TaskEnv:
             up = cam_T[:3, 1]
             cam.update_camera_pose(pos=tuple(pos), lookat=tuple(lookat), up=tuple(up))
 
+    def _camera_viewmat_cv(self, name: str) -> np.ndarray:
+        view = next(v for v in self.camera_views if v.name == name)
+        if view.attach_link is not None:
+            link_T = _pose_to_T(self._attach_links[name].get_pos(), self._attach_links[name].get_quat())
+            c2w_cv = link_T @ (self._attach_offsets[name] @ T_GL_TO_CV)
+        else:
+            c2w_cv = self.episode_extrinsics[name]
+        return invert_rigid(np.asarray(c2w_cv, dtype=np.float64)[None])[0]
+
+    def _render_splat_bg(self, names: list[str] | None = None) -> None:
+        if self._splat_renderer is None:
+            return
+        names = list(self.cams) if names is None else names
+        if not names:
+            return
+        viewmats = np.stack([self._camera_viewmat_cv(name) for name in names])
+        Ks = np.stack([self.intrinsics(name) for name in names])
+        width, height = self.res
+        frames = self._splat_renderer.render(
+            viewmats,
+            Ks,
+            width,
+            height,
+        )
+        for name, frame in zip(names, frames, strict=True):
+            self._splat_bg_frames[name] = frame
+
+
     # -- observations --
     def render(self) -> dict[str, np.ndarray]:
         out = {}
         for name, cam in self.cams.items():
+            bg = self._splat_bg_frames.get(name)
             if hasattr(cam, "render"):
-                rgb = cam.render(rgb=True)[0]
+                if bg is not None:
+                    rgb, _, seg, _ = cam.render(rgb=True, segmentation=True)
+                else:
+                    rgb = cam.render(rgb=True)[0]
             else:
                 rgb = cam.read(envs_idx=0).rgb
+                seg = None
             if hasattr(rgb, "detach"):
                 rgb = rgb.detach().cpu().numpy()
             else:
                 rgb = np.asarray(rgb)
             if rgb.ndim == 4:
                 rgb = rgb[0]
+            if bg is not None and seg is not None:
+                if hasattr(seg, "detach"):
+                    seg = seg.detach().cpu().numpy()
+                else:
+                    seg = np.asarray(seg)
+                if seg.ndim == 3 and seg.shape[0] == 1:
+                    seg = seg[0]
+                rgb = np.where((seg == 0)[..., None], bg, rgb[..., :3])
             out[name] = np.ascontiguousarray(rgb[..., :3]).astype(np.uint8)
         return out
 
@@ -956,7 +1034,7 @@ class TaskEnv:
         cam_to_world_gl = np.asarray(self.cams[name].transform, dtype=np.float64)
         if cam_to_world_gl.ndim == 3:
             cam_to_world_gl = cam_to_world_gl[0]
-        return cam_to_world_gl @ _T_GL_TO_CV
+        return cam_to_world_gl @ T_GL_TO_CV
 
     def proprio(self):
         """Return (joint_pos, joint_vel, joint_eff) for the 7 arm joints and the EE pose."""
