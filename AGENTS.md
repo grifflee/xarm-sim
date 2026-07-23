@@ -313,8 +313,12 @@ Simulation and toggle notes:
 - `--backend gpu|cpu`: Genesis backend. Use `gpu` on mayo/RTX for normal work.
 - `--env.render-backend raster|nyx|batch`: all three can composite the aligned splat;
   `batch` is the Madrona path and supports either its ray tracer or rasterizer via
-  `--env.use-rasterizer`. The 2026-07-23 checkpoint compares all three. Do not choose
-  the 10k production renderer until grifflee reviews that labeled parity artifact.
+  `--env.use-rasterizer`. The 2026-07-23 checkpoint compares all three.
+- Batch + gsplat must keep `--env.batch-shadow-catcher` enabled. The baked splat table
+  cannot receive dynamic light, so a segmented neutral receiver captures Madrona's
+  shadow attenuation; compositing applies that softened mask to the original splat
+  pixels and discards the receiver. Defaults approved by grifflee on 2026-07-23 are
+  strength 0.45 and blur sigma 3 px. See `docs/BATCH_SHADOW_CATCHER.md`.
 - `--env.nyx-spp N`: Nyx samples per pixel. Default is 8; increasing it costs time.
 - `--env.splat-uri PATH`: defaults to `assets/lab_aligned.ply`, the byte-identical
   `assets-v1` release asset (328,002,116 bytes; md5

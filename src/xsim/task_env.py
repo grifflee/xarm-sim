@@ -20,6 +20,7 @@ import math
 from pathlib import Path
 from typing import Literal
 
+import cv2
 import numpy as np
 import torch
 
@@ -640,6 +641,12 @@ class TaskEnvCfg:
     show_viewer: bool = False
     render_backend: Literal["raster", "nyx", "batch"] = "raster"
     use_rasterizer: bool = False
+    # The gsplat table is a baked background and cannot receive Madrona's dynamic
+    # shadows. A hidden neutral receiver captures them and transfers only their
+    # attenuation onto the splat pixels during compositing.
+    batch_shadow_catcher: bool = True
+    batch_shadow_strength: float = 0.45
+    batch_shadow_blur_px: float = 3.0
     splat_bg: bool = True
     splat_uri: Path | None = DEFAULT_SPLAT_PATH
     splat_pos: tuple[float, float, float] | None = (0.0, 0.0, 0.0)
@@ -716,6 +723,9 @@ class TaskEnv:
             **({"renderer": renderer} if renderer is not None else {}),
         )
 
+        self._batch_shadow_catcher = None
+        self._batch_shadow_catcher_seg_ids: set[int] = set()
+
         # flat table plane: always provides collision at the aligned table-top height
         # (z=0). In plane mode it is also the visible infinite tabletop.
         t = self.cfg.table
@@ -753,6 +763,27 @@ class TaskEnv:
                 )
         elif self.cfg.table_mode != "plane":
             raise ValueError(f"unknown table_mode: {self.cfg.table_mode!r}")
+
+        if (
+            self.cfg.render_backend == "batch"
+            and self.cfg.splat_bg
+            and self.cfg.table_transparent
+            and self.cfg.table_mode == "slab"
+            and self.cfg.batch_shadow_catcher
+        ):
+            # A 2 mm visual-only top exactly under the physical table plane. It is
+            # removed from RGB by segmentation after contributing receiver shadows.
+            catcher_h = 0.002
+            self._batch_shadow_catcher = self.scene.add_entity(
+                gs.morphs.Box(
+                    size=(t.size_xy[0], t.size_xy[1], catcher_h),
+                    pos=(t.center_xy[0], t.center_xy[1], t.top_z - catcher_h / 2.0),
+                    fixed=True,
+                    visualization=True,
+                    collision=False,
+                ),
+                surface=gs.surfaces.Plastic(color=(0.35, 0.35, 0.35), roughness=0.8),
+            )
 
         d = self.cfg.base_decor
         if d.enabled:
@@ -798,6 +829,14 @@ class TaskEnv:
         self._add_cameras()
 
         self.scene.build(n_envs=1)
+        if self._batch_shadow_catcher is not None:
+            entity_idx = self._batch_shadow_catcher.idx
+            for seg_idx, key in self.scene.visualizer.segmentation_idx_dict.items():
+                key_entity_idx = key[0] if isinstance(key, tuple) else key
+                if key_entity_idx == entity_idx:
+                    self._batch_shadow_catcher_seg_ids.add(int(seg_idx))
+            if not self._batch_shadow_catcher_seg_ids:
+                raise RuntimeError("batch shadow catcher has no segmentation ID")
         self.robot.set_pd_gains()
         self._tcp_link = self.robot._robot_entity.get_link("link_tcp")
         self._grasp_welded = False
@@ -1368,6 +1407,32 @@ class TaskEnv:
 
 
     # -- observations --
+    def _composite_splat(self, rgb: np.ndarray, seg: np.ndarray, bg: np.ndarray) -> np.ndarray:
+        """Composite foreground plus a softened receiver shadow over the splat."""
+        out = np.where((seg == 0)[..., None], bg, rgb[..., :3])
+        if not self._batch_shadow_catcher_seg_ids:
+            return out
+
+        catcher = np.isin(seg, tuple(self._batch_shadow_catcher_seg_ids))
+        if not np.any(catcher):
+            return out
+        luma = np.asarray(rgb[..., :3], dtype=np.float32).mean(axis=-1)
+        reference = float(np.percentile(luma[catcher], 95.0))
+        if reference <= 1.0:
+            return out
+        shadow = np.zeros_like(luma, dtype=np.float32)
+        shadow[catcher] = 1.0 - np.clip(luma[catcher] / reference, 0.0, 1.0)
+        sigma = max(0.0, float(self.cfg.batch_shadow_blur_px))
+        if sigma > 0.0:
+            weights = cv2.GaussianBlur(catcher.astype(np.float32), (0, 0), sigma)
+            shadow = cv2.GaussianBlur(shadow, (0, 0), sigma) / np.maximum(weights, 1e-6)
+            shadow[~catcher] = 0.0
+        strength = float(np.clip(self.cfg.batch_shadow_strength, 0.0, 1.0))
+        factor = np.clip(1.0 - strength * shadow, 0.0, 1.0)
+        shadowed_bg = np.clip(bg.astype(np.float32) * factor[..., None], 0.0, 255.0).astype(np.uint8)
+        out[catcher] = shadowed_bg[catcher]
+        return out
+
     def render(self) -> dict[str, np.ndarray]:
         out = {}
         force = self._render_stale and self.cfg.render_backend == "batch"
@@ -1397,7 +1462,7 @@ class TaskEnv:
                     seg = np.asarray(seg)
                 if seg.ndim == 3 and seg.shape[0] == 1:
                     seg = seg[0]
-                rgb = np.where((seg == 0)[..., None], bg, rgb[..., :3])
+                rgb = self._composite_splat(rgb, seg, bg)
             out[name] = np.ascontiguousarray(rgb[..., :3]).astype(np.uint8)
         return out
 

@@ -5,8 +5,9 @@ Date: 2026-07-23
 Artifact root: `/data/store/griffen_sim_mcaps/lift_10k_checkpoint`
 
 The 10,000-episode run has **not** started. Physical/no-weld grasp was approved by
-grifflee on 2026-07-23; renderer lighting remains a human gate because the first Madrona
-composite videos did not show dynamic tabletop shadows.
+grifflee on 2026-07-23. The missing Madrona tabletop shadows were fixed with the
+segmented splat shadow catcher documented in `docs/BATCH_SHADOW_CATCHER.md`; grifflee
+approved the labeled before/after video the same day.
 
 ## What to review
 
@@ -24,5 +25,5 @@ composite videos did not show dynamic tabletop shadows.
 - `smoke_batch_100000/`: three 640x480 MCAPs. The format comparison and real-MCAP layout
   validation pass; all three demonstrations succeed.
 
-Before 10k generation, resolve and review the tabletop-shadow regression, then choose the
-renderer. The grasp decision is final: physical/no-weld with `noslip_iterations=10`.
+The grasp decision is final: physical/no-weld with `noslip_iterations=10`. Regenerate and
+gate the ten-case checkpoint with the approved shadow catcher before 10k generation.
