@@ -28,6 +28,7 @@ import gs_nyx.nyx_py_renderer as npr
 import gs_nyx.nyx_py_sdk as nps
 from gs_nyx_plugin.nyx_camera_options import NyxCameraOptions
 
+from xsim.batch_renderer import BatchConfig
 from xsim.grasp_env import Manipulator, ROBOT_VISUAL_MATERIALS, _robot_material_name, _set_vgeom_surface
 from xsim.splat_bg import SplatAsset, SplatBackground, T_GL_TO_CV, invert_rigid, viewmats_cv
 
@@ -107,6 +108,11 @@ def quat_xyzw_from_rpy_deg(roll: float, pitch: float, yaw: float) -> tuple[float
         cr * cp * sy - sr * sp * cy,
         cr * cp * cy + sr * sp * sy,
     )
+
+
+def _rot_from_rpy_deg(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    x, y, z, w = quat_xyzw_from_rpy_deg(roll, pitch, yaw)
+    return _quat_wxyz_to_rot((w, x, y, z))
 
 
 def _make_light_field(
@@ -601,8 +607,13 @@ class TaskEnvCfg:
     # None preserves Genesis' default robot collision import. Set to 0.0 to force
     # convex decomposition of robot meshes instead of coarse per-mesh hulls.
     robot_decompose_robot_error_threshold: float | None = None
-    rectangle_x: tuple[float, float] = (0.20, 0.40)   # cube spawn range (m)
+    # Lift spawns are rejection-sampled from this rectangle into an annulus about
+    # the base. The bounds are backed by scripts/spawn_feasibility.py (2026-07-23):
+    # top-down grasps were clean at r=0.275..0.700; 0.445 stays well inside reach.
+    rectangle_x: tuple[float, float] = (0.0, 0.445)
     rectangle_y: tuple[float, float] = (-0.288, 0.288)
+    spawn_radius: tuple[float, float] | None = (0.25, 0.445)
+    spawn_max_tries: int = 100
     # drop target: "middle of the table" — x sampled per episode, y fixed on the centerline.
     # The release happens at the transport height (no lowering); the cube free-falls.
     drop_x_range: tuple[float, float] = (0.30, 0.40)
@@ -611,16 +622,24 @@ class TaskEnvCfg:
     # fixed IK-solved home before the episode starts (the policy reads the actual TCP at
     # reset, so the trajectory adapts). 0 = every episode starts from the identical pose.
     arm_start_jitter_deg: float = 3.0
+    arm_start_mode: Literal["home", "mixture"] = "mixture"
+    arm_start_weights: tuple[float, float, float, float] = (0.40, 0.25, 0.25, 0.10)
+    arm_start_max_tries: int = 20
+    arm_start_tcp_error_tol: float = 0.03
+    arm_start_post_drop_y_jitter: float = 0.04
+    arm_start_far_radius: tuple[float, float] = (0.50, 0.58)
+    arm_start_far_heading_deg: tuple[float, float] = (-40.0, 40.0)
+    arm_start_far_z: tuple[float, float] = (0.05, 0.25)
+    arm_start_broad_radius: tuple[float, float] = (0.20, 0.58)
+    arm_start_broad_heading_deg: tuple[float, float] = (-49.0, 49.0)
+    arm_start_broad_z: tuple[float, float] = (0.02, 0.35)
     table: TableCfg = field(default_factory=TableCfg)
     base_decor: BaseDecorCfg = field(default_factory=BaseDecorCfg)
     table_mode: Literal["slab", "plane"] = "slab"  # plane = visible infinite tabletop, no finite cart slab
     table_transparent: bool = True         # baked splat supplies table pixels; collision stays live
     show_viewer: bool = False
-    # Upstream shades foreground geometry with the Madrona raytracer. The
-    # currently locked wheel hard-aborts while linking its BVH kernels, so this
-    # single-env path explicitly falls back to Genesis raster. A future batched
-    # generator must revalidate this visual boundary before changing backends.
-    render_backend: Literal["raster", "nyx"] = "raster"
+    render_backend: Literal["raster", "nyx", "batch"] = "raster"
+    use_rasterizer: bool = False
     splat_bg: bool = True
     splat_uri: Path | None = DEFAULT_SPLAT_PATH
     splat_pos: tuple[float, float, float] | None = (0.0, 0.0, 0.0)
@@ -659,7 +678,11 @@ class TaskEnvCfg:
     cube_value_jitter: float = 0.0           # multiplicative +/- fraction in HSV value
     appearance_seed: int | None = None       # set by the generator for reproducible appearance samples
     # Per-reset pose distribution; names, FOVs, resolution, and topics stay fixed.
-    camera_mode: Literal["fixed", "ball", "shell"] = "shell"
+    camera_mode: Literal["fixed", "jitter", "ball", "shell"] = "jitter"
+    cam_jitter_deg: float = 15.0
+    cam_jitter_cm: float = 5.0
+    wrist_jitter_deg: float = 0.0
+    wrist_jitter_cm: float = 0.0
 
 
 class TaskEnv:
@@ -676,6 +699,9 @@ class TaskEnv:
         self.record_dt = self.cfg.physics_dt * self.cfg.record_every
         self.episode_appearance = self._sample_appearance(self.cfg.appearance_seed)
 
+        renderer = None
+        if self.cfg.render_backend == "batch":
+            renderer = gs.options.renderers.BatchRenderer(use_rasterizer=self.cfg.use_rasterizer)
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self.cfg.physics_dt, substeps=4),
             rigid_options=gs.options.RigidOptions(
@@ -687,6 +713,7 @@ class TaskEnv:
             ),
             profiling_options=gs.options.ProfilingOptions(show_FPS=False),
             show_viewer=self.cfg.show_viewer,
+            **({"renderer": renderer} if renderer is not None else {}),
         )
 
         # flat table plane: always provides collision at the aligned table-top height
@@ -767,6 +794,7 @@ class TaskEnv:
         self._splat_renderer: SplatBackground | None = None
         self._splat_bg_frames: dict[str, np.ndarray] = {}
         self._splat_steps = 0
+        self._render_stale = False
         self._add_cameras()
 
         self.scene.build(n_envs=1)
@@ -775,6 +803,12 @@ class TaskEnv:
         self._grasp_welded = False
         self._cube_yaw = 0.0
         self.current_drop_xy = (float(np.mean(self.cfg.drop_x_range)), self.cfg.drop_y)
+        # Upstream's randomized-start port keeps the home EE orientation and IK-solves
+        # only position. Seat home once so the reference is explicit and reproducible.
+        self.robot.reset(envs_idx=None, skip_forward=False)
+        self._home_ee_quat = _as_single_np(self.robot.ee_pose)[3:7].copy()
+        self.arm_start_fallbacks = 0
+        self.episode_arm_start: dict = {}
 
         # place static cams + attach wrist cam; keep the nominal poses that per-episode
         # jitter centers on, and the attach machinery so reset() can re-pose everything
@@ -947,7 +981,21 @@ class TaskEnv:
                 res=self.res, fov=view.fov_deg or self.cfg.fov_deg, GUI=False,
                 pos=view.pos or (1.0, 0.0, 0.5), lookat=view.lookat or (0.0, 0.0, 0.0),
                 near=0.02, far=50.0,  # default near=0.1 clips the wrist cam's own gripper
+                **({} if self.cfg.render_backend == "batch" else {"env_idx": 0}),
             )
+        if self.cfg.render_backend == "batch":
+            # Madrona ignores Genesis scene lights; without this explicit rig the
+            # foreground is near-black before splat compositing.
+            for light in BatchConfig(use_rasterizer=self.cfg.use_rasterizer).lights:
+                self.scene.add_light(
+                    pos=light.position,
+                    dir=light.direction,
+                    color=light.color,
+                    directional=True,
+                    castshadow=light.castshadow,
+                    cutoff=45.0,
+                    intensity=light.intensity,
+                )
 
     def _place_cube(self, cube, x: float, y: float, yaw: float) -> None:
         z = self.cfg.table.top_z + BLOCK_SIZE / 2.0
@@ -975,6 +1023,132 @@ class TaskEnv:
             return gx, gy, x, y
         return gx, gy, x, y
 
+    def _sample_lift_xy(self, rng: np.random.Generator) -> tuple[float, float]:
+        """Sample the lift proposal rectangle, optionally rejecting outside an annulus."""
+        if self.cfg.spawn_radius is None:
+            return (
+                float(rng.uniform(*self.cfg.rectangle_x)),
+                float(rng.uniform(*self.cfg.rectangle_y)),
+            )
+        r_lo, r_hi = self.cfg.spawn_radius
+        if r_lo < 0.0 or r_hi < r_lo:
+            raise ValueError(f"invalid spawn_radius: {self.cfg.spawn_radius!r}")
+        last = (0.0, 0.0)
+        for _ in range(max(1, self.cfg.spawn_max_tries)):
+            last = (
+                float(rng.uniform(*self.cfg.rectangle_x)),
+                float(rng.uniform(*self.cfg.rectangle_y)),
+            )
+            if r_lo <= math.hypot(*last) <= r_hi:
+                return last
+        raise RuntimeError(
+            f"failed to sample lift spawn in annulus {self.cfg.spawn_radius} "
+            f"from rectangle {self.cfg.rectangle_x} x {self.cfg.rectangle_y}; last={last}"
+        )
+
+    def _reset_home_arm(self, rng: np.random.Generator, *, bucket: str = "home", fallback=False) -> None:
+        arm_offset = None
+        if self.cfg.arm_start_jitter_deg > 0.0:
+            arm_offset = rng.uniform(-1.0, 1.0, 7) * math.radians(self.cfg.arm_start_jitter_deg)
+        self.robot.reset(envs_idx=None, skip_forward=False, arm_qpos_offset=arm_offset)
+        achieved = _as_single_np(self.robot.ee_pose)[:3]
+        self.episode_arm_start = {
+            "bucket": bucket,
+            "fallback": bool(fallback),
+            "attempts": 0,
+            "requested_tcp": None,
+            "achieved_tcp": achieved.tolist(),
+            "tcp_error": None,
+            "cumulative_fallbacks": self.arm_start_fallbacks,
+        }
+
+    def _sample_arm_start_tcp(self, rng: np.random.Generator, bucket: str) -> np.ndarray:
+        if bucket == "post_drop":
+            return np.array(
+                [
+                    rng.uniform(*self.cfg.drop_x_range),
+                    self.cfg.drop_y + rng.uniform(
+                        -self.cfg.arm_start_post_drop_y_jitter,
+                        self.cfg.arm_start_post_drop_y_jitter,
+                    ),
+                    self.cfg.table.top_z + 0.018 + 0.09,
+                ],
+                dtype=np.float64,
+            )
+        if bucket == "far":
+            r = float(rng.uniform(*self.cfg.arm_start_far_radius))
+            heading = math.radians(float(rng.uniform(*self.cfg.arm_start_far_heading_deg)))
+            z = float(rng.uniform(*self.cfg.arm_start_far_z))
+        elif bucket == "broad":
+            r = float(rng.uniform(*self.cfg.arm_start_broad_radius))
+            heading = math.radians(float(rng.uniform(*self.cfg.arm_start_broad_heading_deg)))
+            z = float(rng.uniform(*self.cfg.arm_start_broad_z))
+        else:
+            raise ValueError(f"unknown arm-start bucket: {bucket!r}")
+        if r > 0.58 + 1e-9:
+            raise ValueError(f"arm-start radius {r:.3f} exceeds the 0.58 m safety cap")
+        return np.array([r * math.cos(heading), r * math.sin(heading), z], dtype=np.float64)
+
+    def _reset_mixture_arm(self, rng: np.random.Generator) -> None:
+        names = ("post_drop", "far", "broad", "home")
+        weights = np.asarray(self.cfg.arm_start_weights, dtype=np.float64)
+        if weights.shape != (4,) or np.any(weights < 0.0) or weights.sum() <= 0.0:
+            raise ValueError(f"invalid arm_start_weights: {self.cfg.arm_start_weights!r}")
+        bucket = names[int(rng.choice(len(names), p=weights / weights.sum()))]
+        if bucket == "home":
+            self._reset_home_arm(rng)
+            return
+
+        ent = self.robot._robot_entity
+        init_qpos = self.robot._init_qpos.unsqueeze(0)
+        quat = torch.as_tensor(
+            self._home_ee_quat, device=init_qpos.device, dtype=init_qpos.dtype
+        ).reshape(1, 4)
+        last_target = None
+        last_error = None
+        for attempt in range(1, max(1, self.cfg.arm_start_max_tries) + 1):
+            target = self._sample_arm_start_tcp(rng, bucket)
+            last_target = target
+            try:
+                qpos = ent.inverse_kinematics(
+                    link=self.robot._ee_link,
+                    pos=torch.as_tensor(target, device=init_qpos.device, dtype=init_qpos.dtype).reshape(1, 3),
+                    quat=quat,
+                    init_qpos=init_qpos,
+                    max_samples=self.robot._args.get("ik_max_samples", 50),
+                    max_solver_iters=self.robot._args.get("ik_max_solver_iters", 20),
+                    damping=self.robot._args.get("ik_damping", 0.01),
+                    dofs_idx_local=self.robot._arm_dof_idx,
+                )
+                arm_qpos = qpos[:, self.robot._arm_dof_idx].reshape(-1)[:7]
+                if not bool(torch.isfinite(arm_qpos).all()):
+                    continue
+                self.robot.reset(envs_idx=None, skip_forward=False, arm_qpos=arm_qpos)
+                achieved = _as_single_np(self.robot.ee_pose)[:3]
+                last_error = float(np.linalg.norm(achieved - target))
+                if last_error <= self.cfg.arm_start_tcp_error_tol:
+                    self.episode_arm_start = {
+                        "bucket": bucket,
+                        "fallback": False,
+                        "attempts": attempt,
+                        "requested_tcp": target.tolist(),
+                        "achieved_tcp": achieved.tolist(),
+                        "tcp_error": last_error,
+                        "cumulative_fallbacks": self.arm_start_fallbacks,
+                    }
+                    return
+            except (RuntimeError, ValueError):
+                continue
+
+        self.arm_start_fallbacks += 1
+        self._reset_home_arm(rng, bucket=bucket, fallback=True)
+        self.episode_arm_start.update(
+            attempts=max(1, self.cfg.arm_start_max_tries),
+            requested_tcp=last_target.tolist() if last_target is not None else None,
+            tcp_error=last_error,
+            cumulative_fallbacks=self.arm_start_fallbacks,
+        )
+
     # -- lifecycle --
     def reset(self, seed: int | None = None) -> None:
         rng = np.random.default_rng(seed)
@@ -998,10 +1172,12 @@ class TaskEnv:
                 "red_green_dist": float(math.hypot(x - gx, y - gy)),
             }
         else:
-            x = float(rng.uniform(*self.cfg.rectangle_x))
-            y = float(rng.uniform(*self.cfg.rectangle_y))
+            x, y = self._sample_lift_xy(rng)
             yaw = float(rng.uniform(-math.pi / 4, math.pi / 4))
-            self.episode_spawn = {"red_xy": [float(x), float(y)]}
+            self.episode_spawn = {
+                "red_xy": [float(x), float(y)],
+                "radius": float(math.hypot(x, y)),
+            }
         self._place_cube(self.cube, x, y, yaw)
         self._cube_yaw = yaw
         self.grasp_release()  # clear any weld left from a previous episode
@@ -1024,15 +1200,18 @@ class TaskEnv:
             self.current_drop_xy = (gx, gy)
         else:
             self.current_drop_xy = (float(rng.uniform(*self.cfg.drop_x_range)), self.cfg.drop_y)
-        arm_offset = None
-        if self.cfg.arm_start_jitter_deg > 0.0:
-            arm_offset = rng.uniform(-1.0, 1.0, 7) * math.radians(self.cfg.arm_start_jitter_deg)
-        # skip_forward=False: this is the episode's one FK pass, so the wrist-cam sync
-        # below sees the jittered pose
-        self.robot.reset(envs_idx=None, skip_forward=False, arm_qpos_offset=arm_offset)
+        # New arm draws remain last. home mode preserves the approved legacy reset;
+        # mixture ports upstream's position-only, home-orientation TCP IK.
+        if self.cfg.arm_start_mode == "home" or self.cfg.task == "stack":
+            self._reset_home_arm(rng)
+        elif self.cfg.arm_start_mode == "mixture":
+            self._reset_mixture_arm(rng)
+        else:
+            raise ValueError(f"unknown arm_start_mode: {self.cfg.arm_start_mode!r}")
         self._sync_attached_cams()
         self._splat_steps = 0
         self._render_splat_bg()
+        self._render_stale = True
 
     # -- grasp weld: while gripped, the cube must not be able to slip (grifflee) --
     def grasp_lock(self) -> None:
@@ -1098,6 +1277,16 @@ class TaskEnv:
                     lookat = pos - c2w_gl[:3, 2]
                     up = c2w_gl[:3, 1]
                     c2w_cv = c2w_gl @ T_GL_TO_CV
+                elif self.cfg.camera_mode == "jitter":
+                    c2w_gl = self._nominal_c2w_gl[view.name].copy()
+                    d_rpy = rng.uniform(-1.0, 1.0, 3) * self.cfg.cam_jitter_deg
+                    d_xyz = rng.uniform(-1.0, 1.0, 3) * (self.cfg.cam_jitter_cm / 100.0)
+                    c2w_gl[:3, :3] = c2w_gl[:3, :3] @ _rot_from_rpy_deg(*d_rpy)
+                    c2w_gl[:3, 3] += d_xyz
+                    pos = c2w_gl[:3, 3]
+                    lookat = pos - c2w_gl[:3, 2]
+                    up = c2w_gl[:3, 1]
+                    c2w_cv = c2w_gl @ T_GL_TO_CV
                 else:
                     pos_b, lookat_b, up_b = self._static_camera_sampler(view).sample(rng, 1)
                     pos, lookat, up = pos_b[0], lookat_b[0], up_b[0]
@@ -1108,8 +1297,19 @@ class TaskEnv:
                     cam.update_camera_pose(pos=tuple(pos), lookat=tuple(lookat), up=tuple(up))
                 self.episode_extrinsics[view.name] = c2w_cv
             else:
-                if self.cfg.camera_mode == "fixed":
+                if self.cfg.camera_mode in ("fixed", "jitter"):
                     offset = np.asarray(view.attach_offset, dtype=np.float64).copy()
+                    if self.cfg.camera_mode == "jitter" and (
+                        self.cfg.wrist_jitter_deg or self.cfg.wrist_jitter_cm
+                    ):
+                        delta = np.eye(4)
+                        delta[:3, :3] = _rot_from_rpy_deg(
+                            *(rng.uniform(-1.0, 1.0, 3) * self.cfg.wrist_jitter_deg)
+                        )
+                        delta[:3, 3] = rng.uniform(-1.0, 1.0, 3) * (
+                            self.cfg.wrist_jitter_cm / 100.0
+                        )
+                        offset = offset @ delta
                 else:
                     pos, lookat, up = WRIST_MOUNT_SAMPLER.sample(rng, 1)
                     offset = (invert_rigid(viewmats_cv(pos, lookat, up)) @ T_GL_TO_CV)[0]
@@ -1170,13 +1370,17 @@ class TaskEnv:
     # -- observations --
     def render(self) -> dict[str, np.ndarray]:
         out = {}
+        force = self._render_stale and self.cfg.render_backend == "batch"
+        self._render_stale = False
         for name, cam in self.cams.items():
             bg = self._splat_bg_frames.get(name)
             if hasattr(cam, "render"):
+                render_kwargs = {"force_render": force} if self.cfg.render_backend == "batch" else {}
                 if bg is not None:
-                    rgb, _, seg, _ = cam.render(rgb=True, segmentation=True)
+                    rgb, _, seg, _ = cam.render(rgb=True, segmentation=True, **render_kwargs)
                 else:
-                    rgb = cam.render(rgb=True)[0]
+                    rgb = cam.render(rgb=True, **render_kwargs)[0]
+                force = False
             else:
                 rgb = cam.read(envs_idx=0).rgb
                 seg = None

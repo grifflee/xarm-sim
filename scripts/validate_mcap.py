@@ -52,8 +52,8 @@ DEFAULT_RELEASE_TAIL_S = 0.3
 DEFAULT_PHYSICS_DT = 1.0 / 120.0
 DEFAULT_RECORD_EVERY = 4
 LIFT_APPROACH_SCALE_CAP = 2.0
-# margins below/above the design envelope; chosen so the lift gate stays exactly the
-# verified 115..240 from the approved batches (design 152..227)
+# Preserve the approved lower truncation margin and upper runaway margin around
+# the new lift design envelope: 152..318 becomes a 115..331 gate.
 FRAME_MARGIN_LOW = 37
 FRAME_MARGIN_HIGH = 13
 

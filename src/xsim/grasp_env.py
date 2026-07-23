@@ -646,9 +646,16 @@ class Manipulator:
         dls_lam_device = "cpu" if self._dls_solve_on_cpu else self._device
         self._dls_lambda_matrix = (0.01**2) * torch.eye(6, device=dls_lam_device)
 
-    def reset(self, envs_idx=None, skip_forward=True, arm_qpos_offset=None):
+    def reset(self, envs_idx=None, skip_forward=True, arm_qpos_offset=None, arm_qpos=None):
+        if arm_qpos is not None and arm_qpos_offset is not None:
+            raise ValueError("arm_qpos and arm_qpos_offset are mutually exclusive")
         qpos = self._init_qpos
-        if arm_qpos_offset is not None:
+        if arm_qpos is not None:
+            qpos = qpos.clone()
+            qpos[: self._arm_dof_dim] = torch.as_tensor(
+                arm_qpos, dtype=qpos.dtype, device=qpos.device
+            ).reshape(-1)[: self._arm_dof_dim]
+        elif arm_qpos_offset is not None:
             qpos = qpos.clone()
             qpos[: self._arm_dof_dim] += torch.as_tensor(
                 arm_qpos_offset, dtype=qpos.dtype, device=qpos.device

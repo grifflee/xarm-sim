@@ -241,6 +241,7 @@ APPEARANCE_JITTER_FIELDS = (
 
 SOURCE_FINGERPRINT_FILES = (
     "scripts/generate_task_dataset.py",
+    "src/xsim/batch_renderer.py",
     "src/xsim/task_env.py",
     "src/xsim/scripted_lift_policy.py",
     "src/xsim/scripted_stack_policy.py",
@@ -639,6 +640,7 @@ def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict
         "extrinsics": {k: np.asarray(v).tolist() for k, v in env.episode_extrinsics.items()},
         "appearance": env.episode_appearance,
         "spawn": env.episode_spawn,
+        "arm_start": env.episode_arm_start,
     }
     stats.update(integrity.stats())
     stats.update(_episode_result(env, cfg, max_rise))
@@ -728,7 +730,7 @@ def _write_manifest(cfg: Config, env: TaskEnv | None, all_stats: list[dict], n_s
     manifest_cfg = replace(cfg, env=env_cfg)
     splat = Path(env_cfg.splat_uri).expanduser() if env_cfg.splat_uri else None
     splat_md5 = None
-    if splat is not None and splat.exists() and env_cfg.render_backend == "nyx":
+    if splat is not None and splat.exists():
         h = hashlib.md5()
         with open(splat, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 22), b""):
@@ -742,7 +744,7 @@ def _write_manifest(cfg: Config, env: TaskEnv | None, all_stats: list[dict], n_s
         "config": _jsonable(manifest_cfg),
         "splat_file": str(splat) if splat else None,
         "splat_md5": splat_md5,
-        "success_rate": f"{n_success}/{cfg.n_episodes}",
+        "success_rate": n_success / cfg.n_episodes if cfg.n_episodes else 0.0,
         "episodes": all_stats,
     }
     (cfg.out_dir / cfg.manifest_name).write_text(json.dumps(manifest, indent=2))
