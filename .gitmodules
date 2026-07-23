@@ -1,0 +1,3 @@
+[submodule "extra/gs-madrona"]
+	path = extra/gs-madrona
+	url = https://github.com/mhyatt000/gs-madrona.git

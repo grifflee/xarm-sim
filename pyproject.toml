@@ -6,12 +6,14 @@ build-backend = "uv_build"
 module-name = "xsim"
 
 [tool.uv.sources]
+gs-madrona = { workspace = true }
 webpolicy = { git = "https://github.com/mhyatt000/webpolicy" }
 xarm-sim = { workspace = true, editable = true }
 
 [tool.uv.workspace]
 members = [
     ".",
+    "extra/gs-madrona",
 ]
 
 [project]
@@ -24,6 +26,7 @@ dependencies = [
     "av>=17.1.0",
     "foxglove-sdk>=0.25.1",
     "genesis-world[render]>=1.2.0",
+    "gs-madrona>=0.0.7.post2",
     "gs-nyx>=0.1.3",
     "gs-nyx-plugin>=0.1.2",
     "gsplat>=1.4.0",
@@ -47,4 +50,16 @@ dev = [
 ]
 
 [tool.uv]
+# gs-madrona builds without isolation, so its build deps must be in the venv
+# first: `uv pip install scikit-build-core nanobind ninja`, then `uv sync --inexact`.
+# On hosts with several CUDA installs, FindCUDAToolkit prefers $CUDACXX over
+# CUDAToolkit_ROOT, and distro libs in /usr/lib/x86_64-linux-gnu can shadow the
+# toolkit's at link time (undefined __nvJitLinkCreate_* at import). Pin them:
+#   CMAKE_ARGS="-DCUDA_cudart_static_LIBRARY=$CUDA_HOME/lib64/libcudart_static.a \
+#     -DCUDA_nvJitLink_LIBRARY=$CUDA_HOME/lib64/libnvJitLink.so \
+#     -DCUDA_NVJITLINK_LIBRARY=$CUDA_HOME/lib64/libnvJitLink.so"
+no-build-isolation-package = ["gs-madrona"]
 environments = ["sys_platform == 'linux'"]
+override-dependencies = [
+    "gs-madrona", # self-build version is 0.0.8
+]
