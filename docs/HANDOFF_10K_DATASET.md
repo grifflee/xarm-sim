@@ -6,8 +6,8 @@ Read `AGENTS.md` first for the standing rules; this file is the delta.
 > Historical incoming handoff: implementation through the required visual/MCAP checkpoint
 > is now complete and pushed in commits `634a29f`, `9313268`, `1b0ba60`, and `6a3f514`.
 > See `docs/10K_CHECKPOINT.md` and `docs/GRASP_WELD_UPSTREAM_AUDIT.md` for current state.
-> The 10,000-episode run remains intentionally blocked on grifflee's visual choice of
-> renderer and grasp mode.
+> Physical/no-weld grasp was approved on 2026-07-23 and the lift weld is retired. The
+> 10,000-episode run remains intentionally blocked on the renderer shadow review.
 
 ---
 

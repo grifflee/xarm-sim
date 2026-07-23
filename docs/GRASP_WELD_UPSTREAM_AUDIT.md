@@ -37,21 +37,17 @@ fixed-tick:
 the cube to be lifted, slow relative to the end effector, near it in XY, physically in
 contact with the robot, and held there for consecutive control ticks.
 
-## Reconciliation in this branch
+## Reconciliation and decision in this branch
 
 The legacy MCAP generator remains useful because it contains the calibrated cameras,
-air-drop protocol, and data contract that the suite generator does not replace. It now
-offers two explicit modes:
+air-drop protocol, and data contract that the suite generator does not replace. After
+reviewing the comparison video, grifflee approved the upstream-style physical grasp on
+2026-07-23 and explicitly retired the lift weld. Lift generation now has no weld mode and
+enforces `noslip_iterations=10`. The stack task's separate legacy weld is unchanged.
 
-- `proximity_weld` (current checkpoint default): the weld may fire only after the same
-  upstream proximity, gripper-band, and 12-control-tick dwell conditions. The old fixed
-  tick is only a timeout. An unreachable target therefore fails without moving the cube.
-- `physical`: no weld at any point; use `noslip_iterations=10`, matching upstream's
-  physical-grasp approach.
-
-Both modes record minimum TCP/cube distance, close XY/Z error, acquisition state, close
-dwell, weld-fired state/step/distance, and gripper norm. Lifted and maximum-rise fields
-are therefore no longer accepted alone as evidence of a valid grasp.
+The lift manifest records minimum TCP/cube distance, close XY/Z error, acquisition state,
+close dwell, TCP/cube distance and gripper norm at acquisition, plus `weld_fired=false`.
+Lifted and maximum-rise fields are not accepted alone as evidence of a valid grasp.
 
 Verified seed `100000` at the production 120 Hz physics rate:
 
@@ -60,7 +56,7 @@ Verified seed `100000` at the production 120 Hz physics rate:
 | proximity-gated weld | yes, after 48 physics ticks (12 control ticks) | physical first | 89.4 mm | 1.1 mm error |
 | physical + no-slip 10 | never | physical | 87.8 mm | 2.18 mm error |
 
-The labeled side-by-side video is packaged at
+The now-historical labeled side-by-side video is packaged at
 `grasp_ab/seed100000_weld_vs_physical_side_by_side.mp4` in the 10k checkpoint directory.
-This is a human decision gate: review the acquisition pop and choose the grasp mode before
-starting the 10,000 episodes.
+It is retained only as provenance for the decision, including the still-visible physical
+contact-seating pop.

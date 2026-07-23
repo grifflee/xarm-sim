@@ -97,14 +97,12 @@ class Config:
     lift_threshold: float = 0.05    # min cube rise (m) for a successful grasp
     deliver_radius: float = 0.12    # max xy dist (m) from the drop target after settling
     grasp_tcp_offset: float = 0.018 # TCP target height above table while closing (m)
-    # proximity_weld preserves the approved dataset carry protocol, but only after
-    # measured physical acquisition. physical matches current upstream: no weld and
-    # requires --env.noslip-iterations 10 for stable carry.
-    grasp_mode: Literal["proximity_weld", "physical"] = "proximity_weld"
     save_failures: bool = False
     stack_xy_tol: float = 0.02      # max xy offset (m) red-vs-green center for a stack
     stack_z_tol: float = 0.008      # max |z error| (m) from the ideal stacked height
-    env: TaskEnvCfg = field(default_factory=TaskEnvCfg)
+    # Lift generation follows current upstream: physical contact only, with the
+    # no-slip solver stabilizing the carry. main() enforces the value for lift.
+    env: TaskEnvCfg = field(default_factory=lambda: TaskEnvCfg(noslip_iterations=10))
 
 
 def _make_policy(env: TaskEnv, cfg: Config, steps_per_segment: int | None = None):
@@ -114,7 +112,7 @@ def _make_policy(env: TaskEnv, cfg: Config, steps_per_segment: int | None = None
 
 
 class GraspIntegrity:
-    """Measured weld gate and permanent per-episode grasp diagnostics."""
+    """Permanent physical-acquisition diagnostics (stack alone retains its weld)."""
 
     def __init__(self, env: TaskEnv, cfg: Config, policy) -> None:
         self.env = env
@@ -130,6 +128,8 @@ class GraspIntegrity:
         self.close_ticks = 0
         self.physical_grasp_detected = False
         self.physical_grasp_step: int | None = None
+        self.physical_grasp_tcp_cube_dist: float | None = None
+        self.physical_grasp_gripper_norm: float | None = None
 
     def observe(self, step_idx: int, cmd) -> None:
         ee = np.asarray(self.env.robot.ee_pose.detach().cpu(), dtype=np.float64).reshape(-1)[:3]
@@ -162,18 +162,12 @@ class GraspIntegrity:
         if acquired and not self.physical_grasp_detected:
             self.physical_grasp_detected = True
             self.physical_grasp_step = step_idx
-        if (
-            self.cfg.grasp_mode == "proximity_weld"
-            and not self.weld_fired
-            and in_close_window
-            and not cmd.open_gripper
-            and acquired
-        ):
-            self.env.grasp_lock()
-            self._record_weld(step_idx, dist, xy_err, z_err, gripper_norm)
+            self.physical_grasp_tcp_cube_dist = dist
+            self.physical_grasp_gripper_norm = gripper_norm
+            self.close_xy_err = xy_err
+            self.close_z_err = z_err
         elif step_idx == deadline and self.close_xy_err is None:
-            # The deadline is now diagnostic/timeout only: never weld on proximity
-            # failure, so the episode can fail honestly.
+            # Deadline is diagnostic only. A missed physical grasp fails honestly.
             self.close_xy_err = xy_err
             self.close_z_err = z_err
 
@@ -193,8 +187,8 @@ class GraspIntegrity:
         self.weld_gripper_norm = gripper_norm
 
     def stats(self) -> dict:
-        return {
-            "grasp_mode": self.cfg.grasp_mode,
+        stats = {
+            "grasp_mode": "stack_weld" if self.cfg.task == "stack" else "physical",
             "min_ee_cube": self.min_ee_cube if np.isfinite(self.min_ee_cube) else None,
             "close_xy_err": self.close_xy_err,
             "close_z_err": self.close_z_err,
@@ -204,12 +198,15 @@ class GraspIntegrity:
             "weld_gripper_norm": self.weld_gripper_norm,
             "physical_grasp_detected": self.physical_grasp_detected,
             "physical_grasp_step": self.physical_grasp_step,
+            "physical_grasp_tcp_cube_dist": self.physical_grasp_tcp_cube_dist,
+            "physical_grasp_gripper_norm": self.physical_grasp_gripper_norm,
             "close_ticks": self.close_ticks,
             "close_control_ticks": self.close_ticks / self.env.cfg.record_every,
             "grasp_timeout_step": self.policy.grasp_lock_step,
             "approach_distance": getattr(self.policy, "approach_distance", None),
             "approach_scale": getattr(self.policy, "approach_scale", None),
         }
+        return stats
 
 
 def _advance_policy_step(
@@ -220,7 +217,7 @@ def _advance_policy_step(
     step_idx: int,
     cmd,
 ) -> None:
-    if step_idx == policy.release_step:
+    if cfg.task == "stack" and step_idx == policy.release_step:
         env.grasp_release()
     env.robot.go_to_goal(
         cmd.pose,
@@ -649,8 +646,8 @@ def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict
 
 def main(cfg: Config) -> None:
     cfg.env.task = cfg.task  # single --task flag drives both the env and the policy
-    if cfg.grasp_mode == "physical" and cfg.env.noslip_iterations < 1:
-        raise ValueError("grasp_mode='physical' requires --env.noslip-iterations 10")
+    if cfg.task == "lift" and cfg.env.noslip_iterations != 10:
+        raise ValueError("lift generation is physical/no-weld and requires --env.noslip-iterations 10")
     appearance_randomized = _appearance_randomization_enabled(cfg.env)
     if cfg.mode == "generate" and appearance_randomized and not cfg.appearance_child and cfg.n_episodes > 1:
         _run_appearance_subprocess_batch(cfg)
@@ -678,6 +675,8 @@ def main(cfg: Config) -> None:
     for ep in range(cfg.n_episodes):
         path = cfg.out_dir / f"episode_{cfg.episode_offset + ep:06d}.mcap"
         stats = run_episode(env, cfg, ep, path)
+        if cfg.task == "lift" and stats.get("weld_fired"):
+            raise RuntimeError("retired lift weld fired; refusing to keep the episode")
         _mark(f"episode_{ep}")
         keep = stats["success"] or cfg.save_failures
         if not keep:

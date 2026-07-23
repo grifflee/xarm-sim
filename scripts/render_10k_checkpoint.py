@@ -59,6 +59,7 @@ def main(cfg: Config) -> None:
         render_backend=cfg.render_backend,
         use_rasterizer=cfg.use_rasterizer,
         nyx_spp=cfg.nyx_spp,
+        noslip_iterations=10,
     )
     env = TaskEnv(env_cfg)
     base = DatasetConfig(env=env_cfg, mode="video", video_fps=cfg.video_fps)

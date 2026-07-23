@@ -4,7 +4,9 @@ Date: 2026-07-23
 
 Artifact root: `/data/store/griffen_sim_mcaps/lift_10k_checkpoint`
 
-The 10,000-episode run has **not** started. These artifacts are the required human gate.
+The 10,000-episode run has **not** started. Physical/no-weld grasp was approved by
+grifflee on 2026-07-23; renderer lighting remains a human gate because the first Madrona
+composite videos did not show dynamic tabletop shadows.
 
 ## What to review
 
@@ -22,5 +24,5 @@ The 10,000-episode run has **not** started. These artifacts are the required hum
 - `smoke_batch_100000/`: three 640x480 MCAPs. The format comparison and real-MCAP layout
   validation pass; all three demonstrations succeed.
 
-Before 10k generation, grifflee must choose the renderer and either the proximity-gated
-weld or physical/no-weld grasp after reviewing these artifacts.
+Before 10k generation, resolve and review the tabletop-shadow regression, then choose the
+renderer. The grasp decision is final: physical/no-weld with `noslip_iterations=10`.

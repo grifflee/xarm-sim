@@ -1213,9 +1213,9 @@ class TaskEnv:
         self._render_splat_bg()
         self._render_stale = True
 
-    # -- grasp weld: while gripped, the cube must not be able to slip (grifflee) --
+    # -- stack-only legacy weld; lift generation is permanently physical/no-weld --
     def grasp_lock(self) -> None:
-        """Weld the cube to link_tcp at its current pose. Call once the close completes."""
+        """Weld the stack task's cube to link_tcp once close completes."""
         if self._grasp_welded:
             return
         solver = self.scene.rigid_solver

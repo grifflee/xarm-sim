@@ -346,10 +346,10 @@ Simulation and toggle notes:
   mount offset. NOT part of the production recipe — every approved batch keeps
   these at 0 (the wrist mount is a verified guess; jittering it has never been
   reviewed).
-- `--grasp-mode proximity-weld|physical`: the former may weld only after measured
-  proximity, the seated gripper-norm band, and 12 equivalent 30 Hz close ticks; the
-  fixed tick is now only a timeout. `physical` never welds and requires
-  `--env.noslip-iterations 10`. Both permanently emit grasp-integrity diagnostics.
+- Lift generation is permanently physical/no-weld as of grifflee's 2026-07-23 visual
+  approval and enforces `--env.noslip-iterations 10`. There is no lift grasp-mode
+  toggle. Manifests retain acquisition diagnostics and `weld_fired=false` as an audit
+  assertion. The separate stack task still uses its legacy weld.
 - Stack appearance randomization: use the dim ceiling-panel recipe (grifflee reviewed
   per-change panels on 2026-07-07), not the earlier over-bright smoke. Pass
   `--env.nyx-light-type ceiling_panel`, `--env.nyx-light-intensity 6`, and
