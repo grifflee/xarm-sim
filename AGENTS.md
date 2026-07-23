@@ -253,12 +253,40 @@ generic grasp demo in places. The current lift-data path is:
 - `outputs/` -- generated artifacts, gitignored. Do not commit MCAPs, videos, reports, or
   large assets.
 
-Common starting point:
+Common starting point (fresh clone / new machine):
 
 ```bash
 cd ~/repo/xarm-sim
-uv sync
+
+# gs-madrona is a SOURCE BUILD (vendored submodule), not a PyPI wheel — the wheel
+# aborts on Blackwell/sm_120 (CUDA 12.4 nvJitLink). See docs/HANDOFF_10K_DATASET.md
+# and the [tool.uv] notes in pyproject.toml. A fresh clone / new machine needs ALL of:
+git submodule update --init --recursive           # extra/gs-madrona + its 10 nested submodules
+uv pip install scikit-build-core nanobind ninja   # build deps (gs-madrona builds w/o isolation)
+
+# Point CUDA_HOME at a >= 12.8 toolkit (12.4 cannot target sm_120). This host used
+# /usr/local/cuda-12.8 — adjust to the new machine (any >= 12.8 toolkit works, incl. 13.x).
+# The pins stop a distro nvcc/lib from shadowing it (else: undefined __nvJitLinkCreate_*
+# at import):
+export CUDA_HOME=/usr/local/cuda-12.8
+export CUDACXX=$CUDA_HOME/bin/nvcc PATH=$CUDA_HOME/bin:$PATH
+export CMAKE_ARGS="-DCUDA_cudart_static_LIBRARY=$CUDA_HOME/lib64/libcudart_static.a \
+  -DCUDA_nvJitLink_LIBRARY=$CUDA_HOME/lib64/libnvJitLink.so \
+  -DCUDA_NVJITLINK_LIBRARY=$CUDA_HOME/lib64/libnvJitLink.so"
+
+uv sync --inexact          # builds gs-madrona from source (~20-40 min first time)
+scripts/fetch_assets.sh    # pulls the gitignored 328 MB splat from GitHub release assets-v1
 ```
+
+Verify the Madrona build took (should render, not abort with exit 134):
+
+```bash
+uv run python scripts/generate_task_dataset.py \
+    --mode video --backend gpu --env.render-backend batch \
+    --video-path outputs/sim_preview/batch_check.mp4 --seed 0
+```
+
+On a host where the toolchain is already set up, `uv sync` alone is enough.
 
 Fast local sanity checks:
 
