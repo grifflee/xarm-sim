@@ -95,7 +95,9 @@ scene. See the trap below.
 ### 3. Reach boundary — measured ✅
 
 `scripts/spawn_feasibility.py` (new), 483 cells at 3 cm pitch, one scripted-lift episode per
-cell. Results: `/data/store/griffen_sim_mcaps/spawn_feasibility/{results.jsonl,summary.json,sweep.log}`.
+cell. Results are committed under `docs/spawn_feasibility/` (`feasibility.png` heatmap,
+`results.jsonl` per-cell, `summary.json`, `sweep.log`) so they travel with the repo; they
+were generated into `/data/store/griffen_sim_mcaps/spawn_feasibility/`.
 
 **The feasible spawn region is an ANNULUS in radius from the base, not a rectangle.**
 
