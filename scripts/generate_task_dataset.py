@@ -551,7 +551,7 @@ def run_video(env: TaskEnv, cfg: Config) -> None:
     cube_start = env.cube_pos().copy()
     max_rise = 0.0
 
-    first = contact_sheet(env.render(), "0000 reset")
+    first = contact_sheet(env.render(), f"0000 reset seed={cfg.seed}")
     height, width = first.shape[:2]
     writer = cv2.VideoWriter(
         str(cfg.video_path),
