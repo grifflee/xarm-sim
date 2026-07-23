@@ -59,7 +59,12 @@ _mark("genesis_import")
 
 from xsim.task_env import BaseDecorCfg, TaskEnv, TaskEnvCfg, StackCfg, TableCfg  # noqa: E402
 from xsim.mcap_writer import CameraSpec, EpisodeMcapWriter  # noqa: E402
-from xsim.scripted_lift_policy import ScriptedLiftPolicy  # noqa: E402
+from xsim.scripted_lift_policy import (  # noqa: E402
+    GRASP_R,
+    GRASP_TOL_XY,
+    GRASP_TOL_Z,
+    ScriptedLiftPolicy,
+)
 from xsim.scripted_stack_policy import ScriptedStackPolicy  # noqa: E402
 # success scoring lives in xsim.success so the eval harness shares one definition;
 # alias keeps the existing _episode_result call sites (and scripts importing it) working
@@ -92,6 +97,10 @@ class Config:
     lift_threshold: float = 0.05    # min cube rise (m) for a successful grasp
     deliver_radius: float = 0.12    # max xy dist (m) from the drop target after settling
     grasp_tcp_offset: float = 0.018 # TCP target height above table while closing (m)
+    # proximity_weld preserves the approved dataset carry protocol, but only after
+    # measured physical acquisition. physical matches current upstream: no weld and
+    # requires --env.noslip-iterations 10 for stable carry.
+    grasp_mode: Literal["proximity_weld", "physical"] = "proximity_weld"
     save_failures: bool = False
     stack_xy_tol: float = 0.02      # max xy offset (m) red-vs-green center for a stack
     stack_z_tol: float = 0.008      # max |z error| (m) from the ideal stacked height
@@ -102,6 +111,124 @@ def _make_policy(env: TaskEnv, cfg: Config, steps_per_segment: int | None = None
     cls = ScriptedStackPolicy if cfg.task == "stack" else ScriptedLiftPolicy
     return cls(env, steps_per_segment=steps_per_segment or cfg.steps_per_segment,
                grasp_tcp_offset=cfg.grasp_tcp_offset)
+
+
+class GraspIntegrity:
+    """Measured weld gate and permanent per-episode grasp diagnostics."""
+
+    def __init__(self, env: TaskEnv, cfg: Config, policy) -> None:
+        self.env = env
+        self.cfg = cfg
+        self.policy = policy
+        self.min_ee_cube = float("inf")
+        self.close_xy_err: float | None = None
+        self.close_z_err: float | None = None
+        self.weld_fired = False
+        self.weld_step: int | None = None
+        self.weld_tcp_cube_dist: float | None = None
+        self.weld_gripper_norm: float | None = None
+        self.close_ticks = 0
+        self.physical_grasp_detected = False
+        self.physical_grasp_step: int | None = None
+
+    def observe(self, step_idx: int, cmd) -> None:
+        ee = np.asarray(self.env.robot.ee_pose.detach().cpu(), dtype=np.float64).reshape(-1)[:3]
+        cube = np.asarray(self.env.cube_pos(), dtype=np.float64).reshape(-1)[:3]
+        dist = float(np.linalg.norm(ee - cube))
+        xy_err = float(np.linalg.norm(ee[:2] - cube[:2]))
+        z_err = abs(float(ee[2] - (self.env.cfg.table.top_z + self.cfg.grasp_tcp_offset)))
+        gripper_norm = float(self.env.gripper_norm())
+        if not self.weld_fired:
+            self.min_ee_cube = min(self.min_ee_cube, dist)
+
+        if self.cfg.task == "stack":
+            # Stack retains its verified fixed close timing; the lift gate below is
+            # the distribution being changed for the 10k lift dataset.
+            if step_idx == self.policy.grasp_lock_step:
+                self.env.grasp_lock()
+                self._record_weld(step_idx, dist, xy_err, z_err)
+            return
+
+        deadline = self.policy.grasp_lock_step
+        in_close_window = self.policy.close_start_step <= step_idx <= deadline
+        near_cube = dist <= GRASP_R and xy_err <= GRASP_TOL_XY and z_err <= GRASP_TOL_Z
+        if in_close_window and not cmd.open_gripper:
+            self.close_ticks += 1
+        # Upstream counts 12 dwell ticks at its 30 Hz control rate. This runner
+        # advances at 120 Hz, so preserve the same physical dwell duration.
+        close_ticks_min = 12 * self.env.cfg.record_every
+        seated = 0.20 < gripper_norm < 0.85 and self.close_ticks >= close_ticks_min
+        acquired = near_cube and seated
+        if acquired and not self.physical_grasp_detected:
+            self.physical_grasp_detected = True
+            self.physical_grasp_step = step_idx
+        if (
+            self.cfg.grasp_mode == "proximity_weld"
+            and not self.weld_fired
+            and in_close_window
+            and not cmd.open_gripper
+            and acquired
+        ):
+            self.env.grasp_lock()
+            self._record_weld(step_idx, dist, xy_err, z_err, gripper_norm)
+        elif step_idx == deadline and self.close_xy_err is None:
+            # The deadline is now diagnostic/timeout only: never weld on proximity
+            # failure, so the episode can fail honestly.
+            self.close_xy_err = xy_err
+            self.close_z_err = z_err
+
+    def _record_weld(
+        self,
+        step_idx: int,
+        dist: float,
+        xy_err: float,
+        z_err: float,
+        gripper_norm: float | None = None,
+    ) -> None:
+        self.weld_fired = True
+        self.weld_step = step_idx
+        self.weld_tcp_cube_dist = dist
+        self.close_xy_err = xy_err
+        self.close_z_err = z_err
+        self.weld_gripper_norm = gripper_norm
+
+    def stats(self) -> dict:
+        return {
+            "grasp_mode": self.cfg.grasp_mode,
+            "min_ee_cube": self.min_ee_cube if np.isfinite(self.min_ee_cube) else None,
+            "close_xy_err": self.close_xy_err,
+            "close_z_err": self.close_z_err,
+            "weld_fired": self.weld_fired,
+            "weld_step": self.weld_step,
+            "weld_tcp_cube_dist": self.weld_tcp_cube_dist,
+            "weld_gripper_norm": self.weld_gripper_norm,
+            "physical_grasp_detected": self.physical_grasp_detected,
+            "physical_grasp_step": self.physical_grasp_step,
+            "close_ticks": self.close_ticks,
+            "close_control_ticks": self.close_ticks / self.env.cfg.record_every,
+            "grasp_timeout_step": self.policy.grasp_lock_step,
+            "approach_distance": getattr(self.policy, "approach_distance", None),
+            "approach_scale": getattr(self.policy, "approach_scale", None),
+        }
+
+
+def _advance_policy_step(
+    env: TaskEnv,
+    cfg: Config,
+    policy,
+    integrity: GraspIntegrity,
+    step_idx: int,
+    cmd,
+) -> None:
+    if step_idx == policy.release_step:
+        env.grasp_release()
+    env.robot.go_to_goal(
+        cmd.pose,
+        open_gripper=cmd.open_gripper,
+        ik_from_current=cfg.task == "lift",
+    )
+    env.step()
+    integrity.observe(step_idx, cmd)
 
 
 APPEARANCE_JITTER_FIELDS = (
@@ -390,6 +517,7 @@ def run_preview(env: TaskEnv, cfg: Config) -> None:
     env.reset(seed=cfg.seed)
     policy = _make_policy(env, cfg)
     policy.reset()
+    integrity = GraspIntegrity(env, cfg, policy)
 
     save_preview_frame(env, cfg.preview_dir, 0, "reset")
 
@@ -405,12 +533,7 @@ def run_preview(env: TaskEnv, cfg: Config) -> None:
     with torch.no_grad():
         for step_idx in range(total):
             cmd = policy.step()
-            if step_idx == policy.grasp_lock_step:
-                env.grasp_lock()
-            if step_idx == policy.release_step:
-                env.grasp_release()
-            env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
-            env.step()
+            _advance_policy_step(env, cfg, policy, integrity, step_idx, cmd)
             if step_idx in milestone_steps:
                 save_preview_frame(env, cfg.preview_dir, step_idx, milestone_steps[step_idx])
 
@@ -423,6 +546,7 @@ def run_video(env: TaskEnv, cfg: Config) -> None:
     env.reset(seed=cfg.seed)
     policy = _make_policy(env, cfg)
     policy.reset()
+    integrity = GraspIntegrity(env, cfg, policy)
     cube_start = env.cube_pos().copy()
     max_rise = 0.0
 
@@ -445,12 +569,7 @@ def run_video(env: TaskEnv, cfg: Config) -> None:
         with torch.no_grad():
             for step_idx in range(record_until):
                 cmd = policy.step()
-                if step_idx == policy.grasp_lock_step:
-                    env.grasp_lock()
-                if step_idx == policy.release_step:
-                    env.grasp_release()
-                env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
-                env.step()
+                _advance_policy_step(env, cfg, policy, integrity, step_idx, cmd)
                 cube = env.cube_pos()
                 max_rise = max(max_rise, float(cube[2] - cube_start[2]))
                 if step_idx % env.cfg.record_every == 0:
@@ -468,6 +587,7 @@ def run_video(env: TaskEnv, cfg: Config) -> None:
     res = _episode_result(env, cfg, max_rise)
     print(f"wrote video ({frame_idx + 1} frames @ {cfg.video_fps:g} fps) to {cfg.video_path}")
     print("video stats: " + " ".join(f"{k}={v}" for k, v in res.items() if k != "green_pos"))
+    print("grasp stats: " + " ".join(f"{k}={v}" for k, v in integrity.stats().items()))
 
 
 def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict:
@@ -478,6 +598,7 @@ def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict
     sps = int(round(cfg.steps_per_segment * tempo_rng.uniform(0.85, 1.30)))
     policy = _make_policy(env, cfg, steps_per_segment=sps)
     policy.reset()
+    integrity = GraspIntegrity(env, cfg, policy)
 
     cube_start = env.cube_pos().copy()
     max_rise = 0.0
@@ -495,12 +616,7 @@ def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict
         with torch.no_grad():
             for i in range(record_until):
                 cmd = policy.step()
-                if i == policy.grasp_lock_step:
-                    env.grasp_lock()      # gripped: the cube can no longer slip
-                if i == policy.release_step:
-                    env.grasp_release()   # open command: the cube free-falls
-                env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
-                env.step()
+                _advance_policy_step(env, cfg, policy, integrity, i, cmd)
                 cube = env.cube_pos()
                 max_rise = max(max_rise, float(cube[2] - cube_start[2]))
                 if i % env.cfg.record_every == 0:
@@ -524,12 +640,15 @@ def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict
         "appearance": env.episode_appearance,
         "spawn": env.episode_spawn,
     }
+    stats.update(integrity.stats())
     stats.update(_episode_result(env, cfg, max_rise))
     return stats
 
 
 def main(cfg: Config) -> None:
     cfg.env.task = cfg.task  # single --task flag drives both the env and the policy
+    if cfg.grasp_mode == "physical" and cfg.env.noslip_iterations < 1:
+        raise ValueError("grasp_mode='physical' requires --env.noslip-iterations 10")
     appearance_randomized = _appearance_randomization_enabled(cfg.env)
     if cfg.mode == "generate" and appearance_randomized and not cfg.appearance_child and cfg.n_episodes > 1:
         _run_appearance_subprocess_batch(cfg)

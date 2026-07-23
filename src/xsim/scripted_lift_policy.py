@@ -33,6 +33,18 @@ class LiftCommand:
 # the recorded opening tail is stationary instead of still drifting to the target.
 SEGMENT_WEIGHTS = (2.6, 0.8, 0.8, 0.4, 1.0, 0.6)
 
+# The verified home-start protocol already budgets 2.6 * steps_per_segment for
+# the approach. Longer starts scale only that segment; the cap prevents a bad IK
+# start from creating an unbounded episode.
+APPROACH_DISTANCE_FLOOR_M = 0.30
+APPROACH_SCALE_CAP = 2.0
+
+# Weld integrity thresholds shared with lift_expert.py. A close command only
+# becomes a simulated grasp when the measured TCP actually arrives at the cube.
+GRASP_R = 0.035
+GRASP_TOL_XY = 0.02
+GRASP_TOL_Z = 0.015
+
 # Gripper pointing straight down (180° about world x from identity), so the approach and
 # grasp are exactly vertical instead of inheriting the ready pose's slight tilt.
 TOP_DOWN_QUAT_WXYZ = (0.0, 1.0, 0.0, 0.0)
@@ -82,7 +94,10 @@ class ScriptedLiftPolicy:
         self.waypoint_names = []
         self.n_steps = 0
         self.release_step = 0   # global step index at which the open command begins
-        self.grasp_lock_step = 0  # global step index at which the close segment completes
+        self.grasp_lock_step = 0  # deadline at which the close segment completes
+        self.close_start_step = 0
+        self.approach_distance = 0.0
+        self.approach_scale = 1.0
 
     def reset(self) -> None:
         env = self.env
@@ -139,9 +154,18 @@ class ScriptedLiftPolicy:
         ]
         n_seg = len(self._waypoints) - 1
         weights = self.segment_weights if len(self.segment_weights) == n_seg else (1.0,) * n_seg
-        self._segment_steps = [max(2, round(w * self.steps_per_segment)) for w in weights]
+        self.approach_distance = float(torch.linalg.norm(above[0, :3] - ee[:3]).item())
+        self.approach_scale = min(
+            APPROACH_SCALE_CAP,
+            max(1.0, self.approach_distance / APPROACH_DISTANCE_FLOOR_M),
+        )
+        self._segment_steps = [
+            max(2, round(w * self.steps_per_segment * (self.approach_scale if i == 0 else 1.0)))
+            for i, w in enumerate(weights)
+        ]
         self._commands = self._make_generator()
         # step 0 is the initial hold; segments follow in order (close is segment 3)
+        self.close_start_step = 1 + sum(self._segment_steps[:2])
         self.grasp_lock_step = 1 + sum(self._segment_steps[:3])
         self.release_step = 1 + sum(self._segment_steps)
         self.n_steps = self.release_step

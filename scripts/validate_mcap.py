@@ -38,11 +38,10 @@ CALIBRATION_TOPIC_COUNTS = {
     "/tf": 3,
 }
 
-# New 2026-07-02 protocol: release_step = 1 + sum(round(weight * sps)); MCAP
-# records until release_step + 0.3 s tail, decimated from 120 Hz to 30 Hz. The exact
-# default tempo-jitter envelope is 152..227 frames (lift); keep a truncation/runaway
-# margin. The gate is task-aware because the stack protocol has an extra
-# lower-to-place segment and therefore a longer envelope.
+# Lift approach timing scales with start-to-first-waypoint distance, floor 1x and
+# cap 2x; other segments remain fixed. MCAP records through a 0.3 s release tail,
+# decimated from 120 Hz to 30 Hz. Keep the approved truncation/runaway margins around
+# the re-derived design envelope. Stack retains its fixed timing.
 TASK_SEGMENT_WEIGHTS = {
     "lift": (2.6, 0.8, 0.8, 0.4, 1.0, 0.6),
     "stack": (2.6, 0.8, 0.8, 0.4, 1.0, 0.8, 0.6),  # xsim.scripted_stack_policy
@@ -52,14 +51,22 @@ TEMPO_RANGE = (0.85, 1.30)
 DEFAULT_RELEASE_TAIL_S = 0.3
 DEFAULT_PHYSICS_DT = 1.0 / 120.0
 DEFAULT_RECORD_EVERY = 4
+LIFT_APPROACH_SCALE_CAP = 2.0
 # margins below/above the design envelope; chosen so the lift gate stays exactly the
 # verified 115..240 from the approved batches (design 152..227)
 FRAME_MARGIN_LOW = 37
 FRAME_MARGIN_HIGH = 13
 
 
-def _recorded_frames(steps_per_segment: int, weights: tuple[float, ...]) -> int:
-    segment_steps = [max(2, round(w * steps_per_segment)) for w in weights]
+def _recorded_frames(
+    steps_per_segment: int,
+    weights: tuple[float, ...],
+    approach_scale: float = 1.0,
+) -> int:
+    segment_steps = [
+        max(2, round(w * steps_per_segment * (approach_scale if i == 0 else 1.0)))
+        for i, w in enumerate(weights)
+    ]
     release_step = 1 + sum(segment_steps)
     release_tail = max(1, round(DEFAULT_RELEASE_TAIL_S / DEFAULT_PHYSICS_DT))
     record_until = release_step + release_tail
@@ -68,9 +75,14 @@ def _recorded_frames(steps_per_segment: int, weights: tuple[float, ...]) -> int:
 
 def design_frame_envelope(task: str = "lift") -> tuple[int, int]:
     weights = TASK_SEGMENT_WEIGHTS[task]
+    max_approach_scale = LIFT_APPROACH_SCALE_CAP if task == "lift" else 1.0
     return (
         _recorded_frames(round(DEFAULT_STEPS_PER_SEGMENT * TEMPO_RANGE[0]), weights),
-        _recorded_frames(round(DEFAULT_STEPS_PER_SEGMENT * TEMPO_RANGE[1]), weights),
+        _recorded_frames(
+            round(DEFAULT_STEPS_PER_SEGMENT * TEMPO_RANGE[1]),
+            weights,
+            max_approach_scale,
+        ),
     )
 
 

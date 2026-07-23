@@ -712,9 +712,18 @@ class Manipulator:
             delta_joint_pos = delta_joint_pos.to(self._device)
         return self._robot_entity.get_qpos() + delta_joint_pos
 
-    def go_to_goal(self, goal_pose: torch.Tensor, open_gripper: bool = True):
+    def go_to_goal(
+        self,
+        goal_pose: torch.Tensor,
+        open_gripper: bool = True,
+        ik_from_current: bool = False,
+    ):
         init_qpos = None
-        if self._args.get("ik_init_at_home", False):
+        if ik_from_current:
+            init_qpos = self._robot_entity.get_qpos()
+            if init_qpos.ndim == 1:
+                init_qpos = init_qpos.unsqueeze(0)
+        elif self._args.get("ik_init_at_home", False):
             init_qpos = self._init_qpos.unsqueeze(0).expand(goal_pose.shape[0], -1)
         q_pos = self._robot_entity.inverse_kinematics(
             link=self._ee_link,
