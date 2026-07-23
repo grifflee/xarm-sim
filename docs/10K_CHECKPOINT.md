@@ -25,5 +25,7 @@ approved the labeled before/after video the same day.
 - `smoke_batch_100000/`: three 640x480 MCAPs. The format comparison and real-MCAP layout
   validation pass; all three demonstrations succeed.
 
-The grasp decision is final: physical/no-weld with `noslip_iterations=10`. Regenerate and
-gate the ten-case checkpoint with the approved shadow catcher before 10k generation.
+The grasp decision is final: physical/no-weld with `noslip_iterations=10`. The ten-case
+batch checkpoint was regenerated through completion after shadow-catcher approval; all
+ten MP4s, reset frames, metadata, and the contact sheet under `visual_batch/` have
+2026-07-23 14:35–14:37 timestamps. No 10k generation job was started.
