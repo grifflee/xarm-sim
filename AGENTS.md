@@ -311,35 +311,45 @@ Simulation and toggle notes:
   `manifest.json`; `preview` writes PNGs; `video` writes an MP4 contact sheet. Preview
   and video do not write MCAP.
 - `--backend gpu|cpu`: Genesis backend. Use `gpu` on mayo/RTX for normal work.
-- `--env.render-backend raster|nyx`: `raster` is fast and has no photoreal splat room;
-  `nyx` is the production photoreal path and reads the splat. Deliverable MCAPs should
-  use `nyx` unless grifflee explicitly asks for a raster-only physics pilot.
+- `--env.render-backend raster|nyx|batch`: all three can composite the aligned splat;
+  `batch` is the Madrona path and supports either its ray tracer or rasterizer via
+  `--env.use-rasterizer`. The 2026-07-23 checkpoint compares all three. Do not choose
+  the 10k production renderer until grifflee reviews that labeled parity artifact.
 - `--env.nyx-spp N`: Nyx samples per pixel. Default is 8; increasing it costs time.
-- `--env.splat-uri PATH`: defaults to `assets/lab_clean.ply` if present, else
-  `/data/store/lab.ply`. Do not swap splats for production without rerunning alignment
-  checks.
+- `--env.splat-uri PATH`: defaults to `assets/lab_aligned.ply`, the byte-identical
+  `assets-v1` release asset (328,002,116 bytes; md5
+  `13a21b6e3df686d2cc7169f52f0879a3`). Its alignment is baked into the PLY and the
+  runtime transform is identity. A missing asset is a hard error; recover it with
+  `scripts/fetch_assets.sh`. Do not swap splats without rerunning alignment checks.
 - `--env.splat-pos`, `--env.splat-quat`, `--env.splat-rot-rpy-deg`, `--env.splat-scale`:
   experiment-only alignment overrides. Do not bake changes without the RANSAC/human
   checkpoint workflow in section 1.
-- `--env.rectangle-x LO HI` / `--env.rectangle-y LO HI`: cube spawn rectangle. Any
-  widening needs a raster pilot, a Nyx pilot, `compare_batches.py`, and grifflee's read.
+- `--env.rectangle-x LO HI` / `--env.rectangle-y LO HI` are the proposal box. The lift
+  default additionally rejects outside `--env.spawn-radius 0.25 0.445`, producing the
+  measured safe annulus about the robot base. Pass `--env.spawn-radius None` only when
+  exact legacy rectangle sampling is required.
+- `--env.arm-start-mode mixture|home`: `mixture` is the 10k proposal (post-drop 40%, far
+  25%, broad 25%, home 10%) and records the selected bucket, target/achieved TCP, IK
+  error, attempts, and fallback. `home` preserves the prior start distribution.
 - `--env.drop-x-range LO HI` / `--env.drop-y Y`: sampled release target. Changing
   these changes label dynamics and success evaluation.
 - `--steps-per-segment`, `--hold-steps`, `--grasp-tcp-offset`: policy/tempo/contact
   controls. These affect the real-vs-sim distribution report.
 - `--save-failures`: keeps failed MCAP rollouts instead of deleting them. Use only for
   debugging; production batches should be success-gated.
-- `--env.cam-jitter-deg`, `--env.cam-jitter-cm`: per-episode jitter of the two
-  STATIC cams (low/side) around their calibrated nominals, recorded in
-  `manifest.json` and the MCAP calibration topics. Config defaults are 0, but the
-  PRODUCTION RECIPE for batches is `--env.cam-jitter-deg 15 --env.cam-jitter-cm 5`
-  — used by every approved batch since batch_v2 (batch_v3, the 5k batch). Pass it
-  explicitly on generation runs; leave it off only for calibration/alignment
-  diagnostics that need the exact nominal poses (blink_test-style checks).
+- `--env.camera-mode jitter|fixed|ball|shell`: `jitter` is the proposed production
+  default and moves low/side by up to 15 degrees / 5 cm about their calibrated nominal
+  poses without changing the aim based on spawn bounds. Those magnitudes remain
+  configurable via `--env.cam-jitter-deg` / `--env.cam-jitter-cm` and are recorded in
+  the manifest and MCAP calibration topics. Use `fixed` for alignment diagnostics.
 - `--env.wrist-jitter-deg`, `--env.wrist-jitter-cm`: same idea for the wrist-cam
   mount offset. NOT part of the production recipe — every approved batch keeps
   these at 0 (the wrist mount is a verified guess; jittering it has never been
   reviewed).
+- `--grasp-mode proximity-weld|physical`: the former may weld only after measured
+  proximity, the seated gripper-norm band, and 12 equivalent 30 Hz close ticks; the
+  fixed tick is now only a timeout. `physical` never welds and requires
+  `--env.noslip-iterations 10`. Both permanently emit grasp-integrity diagnostics.
 - Stack appearance randomization: use the dim ceiling-panel recipe (grifflee reviewed
   per-change panels on 2026-07-07), not the earlier over-bright smoke. Pass
   `--env.nyx-light-type ceiling_panel`, `--env.nyx-light-intensity 6`, and
