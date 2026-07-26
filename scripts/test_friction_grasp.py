@@ -35,6 +35,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 import genesis as gs  # noqa: E402
 
 from xsim.task_env import TaskEnv, TaskEnvCfg  # noqa: E402
+from xsim.grasp_slip import cube_rel_tcp  # noqa: E402
 
 from generate_task_dataset import (  # noqa: E402
     Config as GenConfig,
@@ -65,41 +66,6 @@ class Config:
     slip_mm_tol: float = 3.0
     slip_deg_tol: float = 5.0
     env: TaskEnvCfg = field(default_factory=TaskEnvCfg)
-
-
-def _quat_conj(q: np.ndarray) -> np.ndarray:
-    return np.array([q[0], -q[1], -q[2], -q[3]])
-
-
-def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    w1, x1, y1, z1 = a
-    w2, x2, y2, z2 = b
-    return np.array([
-        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-    ])
-
-
-def _quat_wxyz_to_rot(q: np.ndarray) -> np.ndarray:
-    w, x, y, z = q
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
-        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
-    ])
-
-
-def _cube_rel_tcp(env: TaskEnv) -> tuple[np.ndarray, np.ndarray]:
-    """Cube pose expressed in the TCP frame (pos meters, quat wxyz)."""
-    p_c = env.cube.get_pos().cpu().numpy().reshape(-1)[:3].astype(np.float64)
-    q_c = env.cube.get_quat().cpu().numpy().reshape(-1)[:4].astype(np.float64)
-    p_t = env._tcp_link.get_pos().cpu().numpy().reshape(-1)[:3].astype(np.float64)
-    q_t = env._tcp_link.get_quat().cpu().numpy().reshape(-1)[:4].astype(np.float64)
-    rel_pos = _quat_wxyz_to_rot(q_t).T @ (p_c - p_t)
-    rel_quat = _quat_mul(_quat_conj(q_t), q_c)
-    return rel_pos, rel_quat / np.linalg.norm(rel_quat)
 
 
 def _write_video_frame(env: TaskEnv, cfg: Config, video_writer, step_idx: int,
@@ -186,7 +152,7 @@ def run_trial(env: TaskEnv, cfg: Config, gen_cfg: GenConfig, seed: int, video_wr
         nonlocal rel0, slip_mm, slip_deg, slip_step, slip_vec
         if step_idx < slip_start:
             return None
-        rel_pos, rel_quat = _cube_rel_tcp(env)
+        rel_pos, rel_quat = cube_rel_tcp(env)
         if rel0 is None:
             rel0 = (rel_pos, rel_quat)
             return 0.0

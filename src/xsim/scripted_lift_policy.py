@@ -41,9 +41,18 @@ APPROACH_SCALE_CAP = 2.0
 
 # Weld integrity thresholds shared with lift_expert.py. A close command only
 # becomes a simulated grasp when the measured TCP actually arrives at the cube.
-GRASP_R = 0.035
-GRASP_TOL_XY = 0.02
-GRASP_TOL_Z = 0.015
+# Acquisition gate for the physical (weld-free) grasp. Read only by GraspIntegrity in
+# scripts/generate_task_dataset.py -- these never influence the commanded trajectory.
+#
+# Tightened 2026-07-26 from (0.035, 0.02, 0.015) against measured pilot data: across 79
+# successful episodes close_xy_err was p50 2.0 mm / max 2.8 mm and close_z_err max 3.0 mm,
+# while the single failure closed 18.4 mm off-centre -- on a cube of 15.9 mm half-width,
+# i.e. gripping the edge -- and sailed through the old 20 mm tolerance before slipping in
+# transit. These are ~2x the worst grasp that has ever succeeded, so they reject edge
+# grasps without excluding anything the pilot kept.
+GRASP_R = 0.012
+GRASP_TOL_XY = 0.006
+GRASP_TOL_Z = 0.006
 
 # Gripper pointing straight down (180° about world x from identity), so the approach and
 # grasp are exactly vertical instead of inheriting the ready pose's slight tilt.

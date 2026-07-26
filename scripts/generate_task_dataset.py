@@ -15,6 +15,7 @@ computed per episode; by default only successful episodes are kept.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import math
 import os
 from pathlib import Path
 import sys
@@ -65,6 +66,13 @@ from xsim.scripted_lift_policy import (  # noqa: E402
     GRASP_TOL_Z,
     ScriptedLiftPolicy,
 )
+from xsim.grasp_slip import (  # noqa: E402
+    SLIP_DEG_TOL,
+    SLIP_MM_TOL,
+    SLIP_SETTLE_STEPS,
+    cube_rel_tcp,
+    slip_since,
+)
 from xsim.scripted_stack_policy import ScriptedStackPolicy  # noqa: E402
 # success scoring lives in xsim.success so the eval harness shares one definition;
 # alias keeps the existing _episode_result call sites (and scripts importing it) working
@@ -98,6 +106,19 @@ class Config:
     deliver_radius: float = 0.12    # max xy dist (m) from the drop target after settling
     grasp_tcp_offset: float = 0.018 # TCP target height above table while closing (m)
     save_failures: bool = False
+
+    # Slip telemetry: cube motion in the TCP frame between close-complete and the open
+    # command. RECORD-ONLY by default (inf thresholds) -- slip_mm/slip_deg always land in
+    # the manifest, but never abort an episode.
+    #
+    # Acquisition (GRASP_TOL_XY etc.) is what actually prevents carrying a bad grasp, and
+    # it is validated: it rejects the 18.4 mm edge grasp that dropped a cube while keeping
+    # all 79 good episodes. A slip abort would guard against a good grasp degrading
+    # mid-transport, which has not been observed in any episode -- so it stays off rather
+    # than risk destroying real episodes on a false positive. Set a finite value to opt in
+    # once there is data justifying a threshold.
+    slip_abort_mm: float = math.inf
+    slip_abort_deg: float = math.inf
     stack_xy_tol: float = 0.02      # max xy offset (m) red-vs-green center for a stack
     stack_z_tol: float = 0.008      # max |z error| (m) from the ideal stacked height
     # Lift generation follows current upstream: physical contact only, with the
@@ -130,6 +151,15 @@ class GraspIntegrity:
         self.physical_grasp_step: int | None = None
         self.physical_grasp_tcp_cube_dist: float | None = None
         self.physical_grasp_gripper_norm: float | None = None
+        # Acquisition/slip gating: the cube must never be carried on a grasp we have
+        # already measured as bad. abort_reason ends the episode early; run_episode then
+        # reports success=False and the existing keep-gate deletes the partial MCAP.
+        self.abort_reason: str | None = None
+        self.abort_step: int | None = None
+        self._slip_ref: tuple[np.ndarray, np.ndarray] | None = None
+        self._slip_ref_step: int | None = None
+        self.slip_mm = 0.0
+        self.slip_deg = 0.0
 
     def observe(self, step_idx: int, cmd) -> None:
         ee = np.asarray(self.env.robot.ee_pose.detach().cpu(), dtype=np.float64).reshape(-1)[:3]
@@ -167,9 +197,44 @@ class GraspIntegrity:
             self.close_xy_err = xy_err
             self.close_z_err = z_err
         elif step_idx == deadline and self.close_xy_err is None:
-            # Deadline is diagnostic only. A missed physical grasp fails honestly.
             self.close_xy_err = xy_err
             self.close_z_err = z_err
+
+        # (a) no acquisition by the deadline -> abort before the transport begins.
+        if (
+            step_idx >= deadline
+            and not self.physical_grasp_detected
+            and self.abort_reason is None
+        ):
+            self._abort("no_grasp", step_idx)
+            return
+
+        # (b) acquired, but the cube moves in the TCP frame -> the grasp is slipping.
+        #
+        # The reference is latched after the CLOSE COMPLETES (grasp_lock_step), matching
+        # scripts/test_friction_grasp.py. Latching at physical_grasp_step instead is
+        # wrong: acquisition is detected mid-close (e.g. step 519 against a 566 lock), so
+        # the reference lands while the cube is still seating into the fingers and normal
+        # seating then reads as slip -- measured 3.5-4.0 mm on grasps that were fine.
+        # The window CLOSES at the open command: after release the cube is meant to leave
+        # the gripper, so its motion relative to the TCP is the intended drop, not slip.
+        # Measuring through the release reads the 0.089 m lift height back as ~92 mm of
+        # "slip" on episodes that delivered to within 3 mm.
+        if self.physical_grasp_detected and self.abort_reason is None and not cmd.open_gripper:
+            settled_at = self.policy.grasp_lock_step + SLIP_SETTLE_STEPS
+            if step_idx == settled_at:
+                self._slip_ref = cube_rel_tcp(self.env)
+                self._slip_ref_step = step_idx
+            elif self._slip_ref is not None and step_idx > settled_at:
+                mm, deg = slip_since(self._slip_ref, cube_rel_tcp(self.env))
+                self.slip_mm = max(self.slip_mm, mm)
+                self.slip_deg = max(self.slip_deg, deg)
+                if mm > self.cfg.slip_abort_mm or deg > self.cfg.slip_abort_deg:
+                    self._abort("slip", step_idx)
+
+    def _abort(self, reason: str, step_idx: int) -> None:
+        self.abort_reason = reason
+        self.abort_step = step_idx
 
     def _record_weld(
         self,
@@ -205,6 +270,12 @@ class GraspIntegrity:
             "grasp_timeout_step": self.policy.grasp_lock_step,
             "approach_distance": getattr(self.policy, "approach_distance", None),
             "approach_scale": getattr(self.policy, "approach_scale", None),
+            # why a dropped episode was dropped: None | "no_grasp" | "slip".
+            # Without this a drop is only visible as delivered=False.
+            "abort_reason": self.abort_reason,
+            "abort_step": self.abort_step,
+            "slip_mm": self.slip_mm,
+            "slip_deg": self.slip_deg,
         }
         return stats
 
@@ -586,6 +657,7 @@ def run_video(env: TaskEnv, cfg: Config) -> None:
     print(f"wrote video ({frame_idx + 1} frames @ {cfg.video_fps:g} fps) to {cfg.video_path}")
     print("video stats: " + " ".join(f"{k}={v}" for k, v in res.items() if k != "green_pos"))
     print("grasp stats: " + " ".join(f"{k}={v}" for k, v in integrity.stats().items()))
+    return {**res, **integrity.stats()}
 
 
 def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict:
@@ -623,11 +695,16 @@ def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict
                     writer.log_step(base_ns + rec * record_dt_ns, imgs, pos, vel, eff, None,
                                     ee_pose=ee, gripper_norm=env.gripper_norm())
                     rec += 1
-            # unrecorded settle: let the cube land for the success evaluation
-            for _ in range(cfg.hold_steps):
-                cmd = policy.step()
-                env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
-                env.step()
+                if integrity.abort_reason is not None:
+                    # Measured-bad grasp: stop before carrying it. The episode scores as a
+                    # failure below and the keep-gate deletes this partial MCAP.
+                    break
+            if integrity.abort_reason is None:
+                # unrecorded settle: let the cube land for the success evaluation
+                for _ in range(cfg.hold_steps):
+                    cmd = policy.step()
+                    env.robot.go_to_goal(cmd.pose, open_gripper=cmd.open_gripper)
+                    env.step()
 
     stats = {
         "episode": global_episode, "frames": rec, "cube_yaw": float(env.cube_yaw()),
@@ -641,6 +718,10 @@ def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict
     }
     stats.update(integrity.stats())
     stats.update(_episode_result(env, cfg, max_rise))
+    if integrity.abort_reason is not None:
+        # An aborted episode never reached the settle, so _episode_result scored a
+        # partial trajectory. Force the failure rather than trusting delivered=False.
+        stats["success"] = False
     return stats
 
 
