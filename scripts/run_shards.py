@@ -113,6 +113,10 @@ class Cfg:
     success_grace_episodes: int = 200
     """Don't apply the success guard until this many episodes have been attempted."""
 
+    stall_abort_s: float = 900.0
+    """Abort if NO shard writes an episode for this long. Counts files on disk, so unlike
+    the success-rate guard it does not depend on shard stdout reaching the log."""
+
     abort_mode: Literal["newest", "all"] = "newest"
 
     shard_index_offset: int = 0
@@ -161,8 +165,18 @@ class Shard:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def kept(self) -> int:
+        """Episodes actually on disk. Ground truth: unlike counts(), this needs nothing
+        from the shard's stdout, which the Genesis stack has been observed to swallow."""
+        return len(list(self.out.glob("episode_*.mcap")))
+
     def counts(self) -> tuple[int, int]:
-        """(attempted, succeeded) parsed from the shard log."""
+        """(attempted, succeeded) parsed from the shard log.
+
+        WARNING: returns (0, 0) when the shard's stdout never reaches the log -- observed
+        on the 2026-07-26 10k run, where 250 episodes/shard produced a 523-byte log. Any
+        guard built on this must treat (0, 0) as "unknown", never as "nothing attempted".
+        """
         try:
             text = self.log.read_text(errors="replace")
         except OSError:
@@ -405,6 +419,13 @@ def main(cfg: Cfg) -> None:
         env = dict(
             os.environ,
             CUDA_VISIBLE_DEVICES=str(s.gpu),
+            # Force unbuffered stdout. During the 2026-07-26 10k run the shard logs stayed
+            # at 523 bytes while 250 episodes/shard were on disk -- far past any 8 KB block
+            # buffer -- so something in the Genesis stack captures or suppresses stdout.
+            # PYTHONUNBUFFERED is the strongest lever available from out here; if the logs
+            # are still empty next run, the success-rate guard below cannot be trusted and
+            # the kept-file progress check is the one that matters.
+            PYTHONUNBUFFERED="1",
             OMP_NUM_THREADS="8",
             MKL_NUM_THREADS="8",
         )
@@ -419,6 +440,7 @@ def main(cfg: Cfg) -> None:
 
     emit(f"\nall {len(shards)} shards up; polling every {cfg.poll_s:.0f}s\n")
     start = time.time()
+    kept_prev, last_progress = 0, time.time()
 
     def kill(s: Shard, why: str) -> None:
         if not s.alive():
@@ -444,6 +466,10 @@ def main(cfg: Cfg) -> None:
             attempted = sum(s.counts()[0] for s in shards)
             succeeded = sum(s.counts()[1] for s in shards)
             rate = succeeded / attempted if attempted else 1.0
+            kept_now = sum(s.kept() for s in shards)
+            if kept_now > kept_prev:
+                kept_prev, last_progress = kept_now, time.time()
+            stalled_s = time.time() - last_progress
             alive = [s for s in shards if s.alive()]
 
             tot_frac, tot_gpu = max((totals[i] / caps[i], i) for i in cfg.gpus)
@@ -451,6 +477,7 @@ def main(cfg: Cfg) -> None:
             foreign_gpu_gb = sum(max(0.0, totals[i] - ours.get(i, 0.0)) for i in cfg.gpus)
             emit(f"[{time.time() - start:7.0f}s] alive={len(alive)}/{len(shards)} "
                  f"eps={succeeded}/{cfg.n_episodes} rate={rate:.1%} "
+                 f"kept={kept_now} stall={stalled_s:.0f}s "
                  f"rss={our_rss:.1f}GB avail={avail:.0f}GB "
                  f"gpu_tot={tot_frac:.0%}(ours {our_gpu_gb:.1f}GB/others "
                  f"{foreign_gpu_gb:.1f}GB) free={free_tb:.2f}TB")
@@ -468,6 +495,9 @@ def main(cfg: Cfg) -> None:
                 reason = f"our aggregate RSS {our_rss:.1f} GB -- we are leaking"
             elif free_tb < cfg.disk_min_free_tb:
                 reason = f"free disk {free_tb:.2f} TB below floor"
+            elif stalled_s > cfg.stall_abort_s:
+                reason = (f"no new episode written for {stalled_s:.0f}s across all shards "
+                          f"-- generation is wedged")
             elif attempted >= cfg.success_grace_episodes and rate < cfg.min_success_rate:
                 reason = f"success rate {rate:.1%} below {cfg.min_success_rate:.0%}"
 
