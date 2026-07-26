@@ -770,8 +770,11 @@ def main(cfg: Config) -> None:
         detail = (f"xy_err={stats['stack_xy_err']:.3f} z_err={stats['stack_z_err']:+.3f} stacked={stats['stacked']}"
                   if cfg.task == "stack" else
                   f"deliver={stats['deliver_dist']:.3f} delivered={stats['delivered']}")
+        # flush: run_shards.py's success-rate guard parses these lines out of the shard
+        # log. Redirected to a file this is block-buffered at 8 KB (~80 episodes), which
+        # silently delays the guard past its grace window and reads attempted=0 meanwhile.
         print(f"[{flag}] ep{ep}: frames={stats['frames']} rise={stats['max_rise']:.3f} "
-              f"lifted={stats['lifted']} {detail}")
+              f"lifted={stats['lifted']} {detail}", flush=True)
 
     _write_manifest(cfg, manifest_env, all_stats, n_success)
     _mark("manifest_write")
