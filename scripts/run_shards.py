@@ -358,8 +358,16 @@ def preflight(cfg: Cfg, shards: list[Shard]) -> list[str]:
             f"floor {cfg.disk_min_free_tb:.2f} TB")
 
     if cfg.n_shards % len(cfg.gpus):
-        problems.append(f"n_shards {cfg.n_shards} not divisible by {len(cfg.gpus)} GPUs "
-                        "-- load will be uneven")
+        # WARNING, not a failure. An uneven split (6 shards over 4 GPUs -> 2,2,1,1) is a
+        # legitimate configuration and may well be the FASTER one: past the contention
+        # knee, fewer shards can beat more. This was a hard error until 2026-07-26, where
+        # it silently blocked the 6-shard arm of a shard-count benchmark -- the one
+        # configuration the benchmark existed to measure.
+        busiest = max(sum(1 for k in range(cfg.n_shards) if k % len(cfg.gpus) == g)
+                      for g in range(len(cfg.gpus)))
+        print(f"note: n_shards {cfg.n_shards} is not divisible by {len(cfg.gpus)} GPUs; "
+              f"load will be uneven ({busiest} on the busiest GPU). Intentional for "
+              "shard-count sweeps.")
     return problems
 
 
