@@ -113,7 +113,19 @@ things slower and never fails.
   did not fix it. Consequence: the **success-rate guard is inert**; the stall guard
   (`stall_abort_s`, counts files) is the one that works.
 - **`du` appears to double after the merge.** `merge_shards.py` hard-links the flat
-  `episode_NNNNNN.mcap` names to the shard-dir inodes. Same bytes, two names.
+  `episode_NNNNNN.mcap` names to the shard-dir inodes. Same bytes, two names -- `du` counts
+  them once and is telling the truth; `ls | wc -l` reads ~2x. Hard links, not symlinks:
+  neither name is "the original", and deleting one leaves the other fully intact.
+- **The arec converter will DOUBLE the dataset if you let it recurse.** `mcap_robot_sim.py`
+  defaults to `recursive=True`, globbing `**/*.mcap`, so pointed at a merged batch root it
+  finds the flat files AND the shard-dir files and ingests every episode twice. It does not
+  error -- you get a silently duplicated dataset. **Always pass `--no-recursive`** when
+  converting a merged batch, so it globs only `*.mcap` at the root.
+- **The shard dirs are redundant after merging** and can be deleted (`rm -rf shard_*`)
+  without losing data or space: the flat hard links keep the bytes, and the merged
+  manifest records every episode's `seed` and `shard`. Keeping them is still recommended --
+  they cost nothing and each carries the per-shard manifest needed to regenerate that
+  block.
 
 ## 4. Extending a batch in place
 
