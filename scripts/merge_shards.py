@@ -41,9 +41,24 @@ def main(c: Cfg) -> None:
 
     merged = dict(manifests[0])
     merged["episodes"] = []
+    dropped = []
+    attempted = sum(len(m["episodes"]) for m in manifests)
     out_idx = 0
     for k, (shard, m) in enumerate(zip(shards, manifests)):
         for ep in m["episodes"]:
+            # Generation is success-gated: a failed episode's MCAP was already deleted by
+            # the keep-gate in generate_task_dataset.py, so linking it would raise
+            # FileNotFoundError -- and merging it would put a failed demonstration into
+            # the training set. Record it and move on.
+            if not ep.get("kept", ep.get("success", True)):
+                dropped.append({
+                    "shard": k,
+                    "seed": ep.get("seed"),
+                    "abort_reason": ep.get("abort_reason"),
+                    "delivered": ep.get("delivered"),
+                    "lifted": ep.get("lifted"),
+                })
+                continue
             src = shard / f"episode_{ep['episode']:06d}.mcap"
             dst = c.batch_dir / f"episode_{out_idx:06d}.mcap"
             if dst.exists():
@@ -57,13 +72,18 @@ def main(c: Cfg) -> None:
 
     merged["config"]["n_episodes"] = out_idx
     merged["config"]["out_dir"] = str(c.batch_dir)
-    n_ok = sum(e["success"] for e in merged["episodes"])
-    merged["success_rate"] = n_ok / out_idx
+    # episodes[] is now kept-only and maps 1:1 onto the files on disk, so the success
+    # rate has to come from the attempt count, not from len(episodes).
+    merged["attempted"] = attempted
+    merged["dropped"] = dropped
+    merged["success_rate"] = out_idx / attempted if attempted else 0.0
+    n_ok = out_idx
     if c.note:
         merged["note"] = c.note
     (c.batch_dir / "manifest.json").write_text(json.dumps(merged, indent=1))
-    print(f"merged {out_idx} episodes from {len(shards)} shards "
-          f"({n_ok}/{out_idx} success) -> {c.batch_dir}/manifest.json")
+    print(f"merged {out_idx} kept episodes from {len(shards)} shards "
+          f"({out_idx}/{attempted} = {merged['success_rate']:.1%} success; "
+          f"{len(dropped)} dropped) -> {c.batch_dir}/manifest.json")
 
 
 if __name__ == "__main__":
