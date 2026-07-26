@@ -288,6 +288,48 @@ uv run python scripts/generate_task_dataset.py \
 
 On a host where the toolchain is already set up, `uv sync` alone is enough.
 
+**RUNTIME TRAP — "Madrona batch renderer is only supported on Linux x86-64."** That
+message is a lie and it will waste your afternoon. `genesis/vis/batch_renderer.py:15-21`
+wraps `from gs_madrona.renderer_gs import MadronaBatchRendererAdapter` in a bare
+`except ImportError` and sets `_MADRONA_AVAILABLE = False`; `build()` then reports the
+platform message for *any* import failure, on a perfectly good Linux x86-64 host. Always
+get the real error before believing it:
+
+```bash
+uv run --no-sync python -c "from gs_madrona.renderer_gs import MadronaBatchRendererAdapter"
+```
+
+The failure seen on the second machine (2026-07-25, luc: 4x L40S sm_89, CUDA 13.3, torch
+2.12.1) was:
+
+```
+ImportError: .../gs_madrona/libmadgs_mgr.so: undefined symbol: __nvJitLinkCreate_13_3,
+             version libnvJitLink.so.13
+```
+
+This is **not** a bad build — it is a load-order collision, and the build is innocent.
+`gs_madrona/` correctly bundles the toolkit's own `libnvJitLink.so.13` (byte-identical to
+`$CUDA_HOME/lib64/libnvJitLink.so.13.3.33`), but torch ships its *own*
+`nvidia/cu13/lib/libnvJitLink.so.13` built from CUDA **13.0**, which exports only up to
+`__nvJitLinkCreate_13_0`. torch imports first, claims the `libnvJitLink.so.13` SONAME
+slot, and `libmadgs_mgr.so` then resolves against the 13.0 library it needs 13.3 symbols
+from. Fix by preloading the toolkit copy so it wins the slot (13.3 is a superset of
+13.0's symbols, so torch is unaffected):
+
+```bash
+export LD_PRELOAD="/usr/local/cuda/lib64/libnvJitLink.so.13${LD_PRELOAD:+:$LD_PRELOAD}"
+```
+
+Required on **every** launch that touches `render_backend=batch` — each generation shard,
+`eval_grid.py`, everything. Check `strings <lib> | grep -oE '__nvJitLinkCreate_13_[0-9]+'`
+on both libraries to confirm which is older before assuming the same fix applies; the
+general rule is that the preloaded library must be the toolkit gs-madrona was *built*
+against. Overwriting torch's copy inside `.venv` also works but is silently undone by the
+next `uv sync`.
+
+Also note `nvcc` may exist but not be on `PATH` (it is at `$CUDA_HOME/bin/nvcc` on luc, so
+`command -v nvcc` reads as absent and looks like "no CUDA toolkit" when there is one).
+
 Fast local sanity checks:
 
 ```bash
@@ -357,9 +399,20 @@ Simulation and toggle notes:
   experiment-only alignment overrides. Do not bake changes without the RANSAC/human
   checkpoint workflow in section 1.
 - `--env.rectangle-x LO HI` / `--env.rectangle-y LO HI` are the proposal box. The lift
-  default additionally rejects outside `--env.spawn-radius 0.25 0.445`, producing the
+  default additionally rejects outside `--env.spawn-radius 0.25 0.55`, producing the
   measured safe annulus about the robot base. Pass `--env.spawn-radius None` only when
   exact legacy rectangle sampling is required.
+  UPDATED 2026-07-26 (was r<=0.445, y in +-0.288): the old outer cap was 60% of the
+  ~0.74 m measured extension — below grifflee's stated 70-80% — so every spawn sat within
+  17.5" of the base. 0.55 is 74% of extension, inside the 0.275-0.700 band
+  `scripts/spawn_feasibility.py` measured as 100% clean.
+  **+y is capped asymmetrically at 0.20**, from `scripts/spawn_visibility.py`: the
+  calibrated low/side rig sits off to one side, so high-+y cubes leave BOTH static frames.
+  Over the old region the cube was in NEITHER static camera in 3.6% of camera-jitter draws
+  (worst cells 26%) — silently producing demonstrations whose input lacked the object.
+  Lift previously had no visibility constraint at all (only "the cube is physically on the
+  table"), unlike stack's `_sample_free_stack_xy` keep-out wedge. The new cap raises
+  worst-case "visible in >=1 static cam" from 0.74 to 0.93 while adding 18% spawn area.
 - `--env.arm-start-mode mixture|home`: `mixture` is the 10k proposal (post-drop 40%, far
   25%, broad 25%, home 10%) and records the selected bucket, target/achieved TCP, IK
   error, attempts, and fallback. `home` preserves the prior start distribution.

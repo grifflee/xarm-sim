@@ -23,3 +23,8 @@ last.ply
 left.png
 depth.png
 depth.npy
+
+# Machine-specific runtime env (CUDA_HOME + the libnvJitLink LD_PRELOAD that gs_madrona
+# needs). Per-host, so it is not tracked -- the trap it works around is documented in
+# AGENTS.md under "RUNTIME TRAP", which is where a new machine should start.
+luc_env.sh

@@ -331,13 +331,17 @@ Then `compare_batches.py` → `FORMAT: PASS` and `validate_mcap.py` against the 
 - **Never kill the generator to trim a batch** — `manifest.json` is only written at a natural
   run end.
 
-**Two provenance bugs to fix first:**
-- `_write_manifest` computes `splat_md5` **only** when `render_backend == "nyx"`
-  (`generate_task_dataset.py:612`). On the raster/composite/batch paths the splat is still
-  used but the md5 records as `None` — and `merge_shards.py:38-40`, which asserts shards
-  agree on `(splat_file, splat_md5)`, degenerates to a no-op.
-- `_write_manifest` writes `success_rate` as the string `"n/N"` while `merge_shards.py:60`
-  overwrites it with a float ratio — two schemas for one key.
+**Two provenance bugs — FIXED in `1b0ba60`, no action needed (verified 2026-07-25):**
+- `_write_manifest` used to compute `splat_md5` only when `render_backend == "nyx"`, so on
+  raster/composite/batch it recorded `None` and `merge_shards.py`'s `(splat_file,
+  splat_md5)` agreement check degenerated to a no-op. The guard is gone; the md5 is now
+  computed whenever the splat file exists, on every render path.
+- `_write_manifest` used to write `success_rate` as the string `"n/N"` while
+  `merge_shards.py` overwrote it with a float ratio. It is now a float in both places.
+
+Confirmed empirically against a `render_backend=batch` run: the shard manifest carries
+`splat_md5: 13a21b6e3df686d2cc7169f52f0879a3` and `success_rate: 1.0` (float). Do not
+re-fix these; the line numbers cited in earlier revisions of this file no longer exist.
 
 ---
 
