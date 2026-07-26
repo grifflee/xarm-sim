@@ -49,6 +49,13 @@ class Config:
     video_fps: float = 30.0
     reset_only: bool = False
 
+    res: tuple[int, int] = (640, 480)
+    """Review videos render LARGER than the training data (TaskEnvCfg.res = 96x72), because
+    96x72 is unwatchable for a human and what is being reviewed here is geometry -- spawn
+    positions, arm starts, approach paths -- not pixel fidelity. Physics, distributions and
+    seeds are identical at any resolution, so the episode you watch is the episode that
+    gets generated."""
+
     seed_start: int | None = None
     """Base seed for the pool/sequential modes. None keeps the curated CASES."""
 
@@ -57,7 +64,7 @@ class Config:
     render) and SELECT `n_seeds` of them by measured state. 0 = plain sequential range."""
 
     n_seeds: int = 100
-    n_featured: int = 10
+    n_featured: int = 12
     """Reviewers do a smell test, not an audit. The first `n_featured` renders are ordered
     to span the distribution deliberately -- neutral/typical draws first, then the edges --
     so watching only those is a fair sample. Filenames are rank-prefixed, so sorted order
@@ -79,13 +86,23 @@ def _probe(env, base, cfg: Config) -> list[dict]:
         policy = _make_policy(env, base)
         policy.reset()
         spawn = env.episode_spawn
+        start = env.episode_arm_start
+        tcp = np.asarray(start.get("achieved_tcp") or [0.0, 0.0, 0.0], dtype=float)
+        cx, cy = float(spawn["red_xy"][0]), float(spawn["red_xy"][1])
         rows.append({
             "seed": seed,
             "radius": float(spawn["radius"]),
-            "x": float(spawn["red_xy"][0]),
-            "y": float(spawn["red_xy"][1]),
-            "bucket": env.episode_arm_start.get("bucket", "unknown"),
+            "x": cx,
+            "y": cy,
+            "bucket": start.get("bucket", "unknown"),
             "approach": float(policy.approach_distance),
+            # arm start position, and how it sits RELATIVE to the cube -- the edge cases
+            # that matter are combinations (cube far / arm near, etc), not each alone
+            "tcp_r": float(np.hypot(tcp[0], tcp[1])),
+            "tcp_z": float(tcp[2]),
+            "sep": float(np.hypot(tcp[0] - cx, tcp[1] - cy)),
+            "lateral": float(abs(tcp[1] - cy)),
+            "radial_gap": float(np.hypot(tcp[0], tcp[1]) - float(spawn["radius"])),
         })
     return rows
 
@@ -106,21 +123,35 @@ def _select(rows: list[dict], cfg: Config) -> list[tuple[str, int]]:
         return min(cand, key=lambda r: (abs(r["radius"] - med_r), abs(r["y"])))
 
     far_rows = [r for r in rows if r["bucket"] == "far"]
+    rmed = sorted(r["radius"] for r in rows)[len(rows) // 2]
+    tmed = sorted(r["tcp_r"] for r in rows)[len(rows) // 2]
+
+    def best(pred, key, rev=False):
+        cand = [r for r in rows if pred(r)]
+        return max(cand, key=key) if (cand and rev) else (min(cand, key=key) if cand else None)
+
     featured: list[tuple[str, dict | None]] = [
-        # three neutral draws first -- a reel of only corner cases misrepresents the batch
+        # two neutral draws first -- a reel of only corner cases misrepresents the batch
         ("neutral_home", typical("home")),
         ("neutral_post_drop", typical("post_drop")),
-        ("neutral_broad", typical("broad")),
-        # the far bucket is 25% of starts and is what "arm begins fully extended, reaching
-        # back toward the base" looks like; an earlier revision of this list omitted it
-        # entirely, so no featured video showed an extended start.
+        # --- the COMBINATIONS: what matters is arm and cube relative to each other ---
+        # cube out at the annulus edge while the arm starts tucked in near the base
+        ("cubeFAR_armNEAR", best(lambda r: r["radius"] > rmed, lambda r: r["tcp_r"])),
+        # arm starts fully extended while the cube sits close in -- the reach-back case
+        ("cubeNEAR_armFAR", best(lambda r: r["radius"] < rmed, lambda r: r["tcp_r"], rev=True)),
+        # arm and cube at similar distance from the base but offset sideways: the arm has
+        # to translate across rather than in/out
+        ("sideBYside_lateral", best(lambda r: abs(r["radial_gap"]) < 0.06, lambda r: r["lateral"], rev=True)),
+        # arm essentially on top of the cube already: shortest possible approach
+        ("armONcube_shortest", by("sep")[0]),
+        # the two furthest apart
+        ("maxSeparation", by("sep", True)[0]),
         ("far_start_backward", max(far_rows, key=lambda r: r["approach"]) if far_rows else None),
-        ("nearest_spawn", by("radius")[0]),
+        # --- absolute extremes of the spawn region ---
         ("farthest_spawn", by("radius", True)[0]),
+        ("nearest_spawn", by("radius")[0]),
         ("positive_y_edge", by("y", True)[0]),
         ("negative_y_edge", by("y")[0]),
-        ("closest_forward_x", by("x")[0]),  # spawns are front-only now; no beside-base case
-        ("longest_approach", by("approach", True)[0]),
     ]
 
     picked: list[tuple[str, int]] = []
@@ -159,6 +190,7 @@ def main(cfg: Config) -> None:
         use_rasterizer=cfg.use_rasterizer,
         nyx_spp=cfg.nyx_spp,
         noslip_iterations=10,
+        res=cfg.res,
     )
     env = TaskEnv(env_cfg)
     base = DatasetConfig(env=env_cfg, mode="video", video_fps=cfg.video_fps)

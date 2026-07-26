@@ -5,6 +5,46 @@ episodes as Foxglove MCAP for training (crossformer). Everything through pilot
 verification is DONE and committed on branch `synthetic-lift-mcap`. Your job is the
 scale-up and its verification. Read this whole file before running anything.
 
+## 2026-07-26: pre-10k session — grasp gate, spawn region, 96x72, machine port
+
+Read this before touching generation; several long-standing assumptions were wrong.
+
+**The model only ever sees 64x64.** Both training (`crossformer/data/grain/loader.py:imresize`
+→ `cv2.resize(f,(64,64))`) and serving (`GrainlikeWrapper._resize_images` →
+`augmax.Resize(64)`, size read back off the checkpoint by `_trained_image_size`) SQUASH the
+full 4:3 frame to 64x64. **There is no crop** — `center_crop` is defined in loader.py and
+never called, `mix_precompatibility` accepts a `resize` arg and ignores it, and
+GrainlikeWrapper's docstring ("crop, resize 224", "224 → 64") is stale on both counts. So
+640x480 was storing ~44x more pixels than the network ever receives. Render res is now
+**96x72** (see the `--env.res` bullet). mhyatt's "I square crop at inference" refers to his
+own MLP path, NOT crossformer — verified on `upstream/dev`, which the fork is level with.
+
+**Grasp acquisition is now a gate, not a comment.** `GRASP_TOL_XY` was 20 mm while real
+grasps close at ~2 mm; an 18.4 mm edge grasp passed it, was transported, and dropped the
+cube. Thresholds are now 12/6/6 mm and `GraspIntegrity` aborts the episode at the close
+instead of only logging. `abort_reason` (`no_grasp` / `slip`) is in the manifest — before
+this, a drop was visible only as `delivered=False`. Slip telemetry is recorded but
+**record-only**; it does not abort (it fired on healthy grasps twice during calibration
+because the measurement window was wrong, and the acquisition gate already covers the
+observed failure).
+
+**Lift spawns had no visibility constraint at all** — only "the cube is on the table" —
+unlike stack's `_sample_free_stack_xy`. `scripts/spawn_visibility.py` measured the cube in
+NEITHER static camera in 3.6% of camera-jitter draws over the old region. Fixed by the
+front-only + `+y<=0.20` region documented below. **The existing 640x480 `xarm_sim` training
+set predates this and carries those defects.**
+
+**`merge_shards.py` would have crashed at the end of any batch containing a failure** — it
+linked every manifest episode including success-gated deletions. Never seen because
+batch_v3 was 100/100. Fixed; it now skips non-kept episodes and records them under
+`dropped`.
+
+**Second machine (luc, 4x L40S):** `scripts/run_shards.py` is the sharded supervisor —
+guards on TOTAL machine pressure (system MemAvailable, total per-GPU VRAM), not just our
+own, because a shared box dying is equally fatal whoever caused it. 8 shards cost only +12%
+per-episode for 7.2x throughput. See the Madrona RUNTIME TRAP section before debugging any
+"only supported on Linux x86-64" message.
+
 ## 2026-07-15: remote CrossFormer lift evaluation findings (`dagger`)
 
 Use `dagger` commit `43632c3` or newer for remote policy evaluation. In
