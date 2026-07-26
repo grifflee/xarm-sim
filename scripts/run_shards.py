@@ -48,10 +48,14 @@ import tyro
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# Measured 2026-07-25 on luc: render_backend=batch, 640x480, 3 cameras, arm-start mixture.
+# Measured on luc: render_backend=batch, 3 cameras, arm-start mixture.
+# VRAM/RSS were measured at 640x480 (2026-07-25) and are kept as CONSERVATIVE upper bounds
+# -- 96x72 uses less, and over-reserving is the safe direction for guards on a shared box.
+# MB/episode is measured at the current 96x72 (2026-07-26) because it drives the disk
+# preflight, where an 82 MB/ep figure would overstate the batch by ~100x.
 MEASURED_VRAM_GB = 8.7
 MEASURED_RSS_GB = 2.6
-MEASURED_MB_PER_EPISODE = 82.0
+MEASURED_MB_PER_EPISODE = 0.83
 EXPECTED_SPLAT_MD5 = "13a21b6e3df686d2cc7169f52f0879a3"
 
 
@@ -111,6 +115,24 @@ class Cfg:
 
     abort_mode: Literal["newest", "all"] = "newest"
 
+    shard_index_offset: int = 0
+    """Name this wave's shard dirs from shard_{offset:02d} upward.
+
+    EXTENDING A BATCH: a second wave writes new shard dirs into the SAME --out-dir, and
+    merge_shards.py globs shard_* so it folds every wave into one flat batch (and one arec
+    build). Continue the seed range and set both offsets past the first wave, e.g. after
+    10,500 attempts from seed 100000 in 8 shards:
+
+        --seed 110500 --shard-index-offset 8 --episode-index-offset 10500 \\
+        --out-dir <same as wave 1>
+
+    Seeds must not overlap a previous wave, or scenes repeat."""
+
+    episode_index_offset: int = 0
+    """Added to every shard's --episode-offset, so a later wave's episode ids continue
+    rather than restart. merge_shards renumbers anyway, but this keeps the raw shard files
+    unambiguous."""
+
     extra_args: str = ""
     """Extra flags forwarded to generate_task_dataset.py, as ONE shell-quoted string.
     Must use the = form or tyro parses the inner flags as its own:
@@ -160,15 +182,16 @@ def plan(cfg: Cfg) -> list[Shard]:
     shards, offset = [], 0
     for k in range(cfg.n_shards):
         n = base + (1 if k < rem else 0)  # spread the remainder over the first shards
+        name_idx = k + cfg.shard_index_offset
         shards.append(
             Shard(
-                idx=k,
+                idx=name_idx,
                 gpu=cfg.gpus[k % len(cfg.gpus)],
                 seed=cfg.seed + offset,
-                offset=offset,
+                offset=offset + cfg.episode_index_offset,
                 n=n,
-                out=cfg.out_dir / f"shard_{k:02d}",
-                log=cfg.log_dir / f"{cfg.out_dir.name}_shard{k:02d}.log",
+                out=cfg.out_dir / f"shard_{name_idx:02d}",
+                log=cfg.log_dir / f"{cfg.out_dir.name}_shard{name_idx:02d}.log",
             )
         )
         offset += n
@@ -299,11 +322,18 @@ def preflight(cfg: Cfg, shards: list[Shard]) -> list[str]:
         if h.hexdigest() != EXPECTED_SPLAT_MD5:
             problems.append(f"splat md5 {h.hexdigest()} != expected {EXPECTED_SPLAT_MD5}")
 
-    # Never silently write into a batch that already has episodes.
-    existing = list(cfg.out_dir.glob("shard_*/episode_*.mcap")) if cfg.out_dir.exists() else []
-    if existing:
-        problems.append(f"{cfg.out_dir} already contains {len(existing)} episodes; "
-                        "pick a fresh --out-dir or delete it deliberately")
+    # Never silently overwrite, but DO allow extending: only the shard dirs this wave
+    # writes must be empty. Earlier waves' shard_* dirs are left alone and merge_shards
+    # folds them all together.
+    clash = [s.out.name for s in shards if list(s.out.glob("episode_*.mcap"))]
+    if clash:
+        problems.append(f"these shard dirs already contain episodes: {clash}; "
+                        "raise --shard-index-offset to extend, or use a fresh --out-dir")
+    prior = sorted({p.parent.name for p in cfg.out_dir.glob("shard_*/episode_*.mcap")}) \
+        if cfg.out_dir.exists() else []
+    if prior:
+        print(f"note: extending an existing batch -- {len(prior)} prior shard dir(s) "
+              f"present ({prior[0]}..{prior[-1]}), they will be left untouched and merged")
 
     # Disk: projected need against free space, keeping the shared-volume floor intact.
     need_tb = cfg.n_episodes * MEASURED_MB_PER_EPISODE / 1e6

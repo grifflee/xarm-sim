@@ -676,6 +676,17 @@ class TaskEnvCfg:
     # over the floor beside the table (measured 4.5% of starts, up to 7.5 cm past the
     # edge). 0 disables the check and restores the pre-2026-07-26 behaviour.
     arm_start_table_margin: float = 0.03
+    # Minimum xy distance from the start TCP to the cube. reset() places the cube and THEN
+    # teleports the arm via set_qpos with no collision check and no settle, so a start pose
+    # sampled on top of the cube would launch it at t=0. post_drop always sits at transport
+    # height (9.2 cm above cube centre) and is safe, but broad's z floor of 0.02 is only
+    # ~1.4 cm above cube centre -- a low broad draw landing near the cube intersects it.
+    # Closest observed in 160 episodes was 1.8 cm laterally. 0 disables the check.
+    arm_start_min_cube_dist: float = 0.12
+    # Height above the cube's TOP face at which a laterally-close start is safe anyway.
+    # post_drop sits 7.6 cm above it, so this keeps that whole bucket (40% of starts)
+    # untouched while still rejecting low broad/far draws that would hit the cube.
+    arm_start_cube_clearance_z: float = 0.06
     table: TableCfg = field(default_factory=TableCfg)
     base_decor: BaseDecorCfg = field(default_factory=BaseDecorCfg)
     table_mode: Literal["slab", "plane"] = "slab"  # plane = visible infinite tabletop, no finite cart slab
@@ -1152,6 +1163,26 @@ class TaskEnv:
             and abs(float(tcp[1])) <= t.size_xy[1] / 2 - m
         )
 
+    def _tcp_clear_of_cube(self, tcp: np.ndarray) -> bool:
+        """Is this start TCP clear of the cube, so the arm cannot disturb it at reset?
+
+        Deliberately 3D. A purely lateral test would reject `post_drop` starts whenever the
+        cube spawns near the drop zone -- but post_drop sits at transport height, a safe
+        7.6 cm ABOVE the cube's top face, and post_drop is 40% of starts. Rejecting those
+        would push them to the home fallback and distort the mixture. Only a start that is
+        both laterally close AND low enough for the fingers to reach the cube is a hazard.
+        """
+        d = self.cfg.arm_start_min_cube_dist
+        if d <= 0.0:
+            return True
+        cube = self.episode_spawn.get("red_xy")
+        if cube is None:  # no cube placed yet (reset() places it first, so this is defensive)
+            return True
+        if math.hypot(float(tcp[0]) - cube[0], float(tcp[1]) - cube[1]) >= d:
+            return True
+        cube_top = self.cfg.table.top_z + BLOCK_SIZE
+        return float(tcp[2]) >= cube_top + self.cfg.arm_start_cube_clearance_z
+
     def _sample_arm_start_tcp(self, rng: np.random.Generator, bucket: str) -> np.ndarray:
         if bucket == "post_drop":
             return np.array(
@@ -1206,6 +1237,8 @@ class TaskEnv:
             # out-of-distribution for the deployment loop, where the arm is always over the
             # table when a human repositions the cube. Redraw instead.
             if not self._tcp_over_table(target):
+                continue
+            if not self._tcp_clear_of_cube(target):
                 continue
             try:
                 qpos = ent.inverse_kinematics(
