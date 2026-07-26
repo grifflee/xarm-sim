@@ -608,12 +608,27 @@ class TaskEnvCfg:
     # None preserves Genesis' default robot collision import. Set to 0.0 to force
     # convex decomposition of robot meshes instead of coarse per-mesh hulls.
     robot_decompose_robot_error_threshold: float | None = None
-    # Lift spawns are rejection-sampled from this rectangle into an annulus about
-    # the base. The bounds are backed by scripts/spawn_feasibility.py (2026-07-23):
-    # top-down grasps were clean at r=0.275..0.700; 0.445 stays well inside reach.
-    rectangle_x: tuple[float, float] = (0.0, 0.445)
-    rectangle_y: tuple[float, float] = (-0.288, 0.288)
-    spawn_radius: tuple[float, float] | None = (0.25, 0.445)
+    # Lift spawns are rejection-sampled from this rectangle into an annulus about the base.
+    #
+    # Reach (scripts/spawn_feasibility.py, 2026-07-23): top-down grasps are 100% clean for
+    # r=0.275..0.700 and full extension is ~0.74. The old 0.445 cap was 60% of extension,
+    # below grifflee's stated "stay at 70-80%" constraint, and put every spawn within 17.5"
+    # of the base. 0.55 is 74% of extension and still well inside the proven-clean band.
+    #
+    # +y is capped asymmetrically at 0.20 by scripts/spawn_visibility.py (2026-07-26, 200
+    # camera-jitter draws): the calibrated low/side rig sits off to one side, so cubes at
+    # high +y fall out of BOTH static frames. Over the old region the cube was in neither
+    # camera in 3.6% of draws (worst cells 26%), which silently produced demonstrations
+    # whose input never contained the object. Capping +y at 0.20 lifts worst-case
+    # "visible in at least one static cam" from 0.74 to 0.93 while ADDING 18% spawn area.
+    # -y needs no cap; it is the well-covered side.
+    # x starts IN FRONT of the base, never beside it (grifflee 2026-07-26). The base's
+    # outer ring is 13 cm across (see BaseDecorCfg), so its front edge is x=+0.065;
+    # 0.115 is that plus a couple of inches. Below this the cube sits level with or behind
+    # the base — awkward to reach, poorly seen by the rig, and not how the real task runs.
+    rectangle_x: tuple[float, float] = (0.115, 0.55)
+    rectangle_y: tuple[float, float] = (-0.288, 0.20)
+    spawn_radius: tuple[float, float] | None = (0.25, 0.55)
     spawn_max_tries: int = 100
     # drop target: "middle of the table" — x sampled per episode, y fixed on the centerline.
     # The release happens at the transport height (no lowering); the cube free-falls.
