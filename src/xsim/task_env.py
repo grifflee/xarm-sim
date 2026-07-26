@@ -6,7 +6,7 @@ A purpose-built Genesis env (reuses ``Manipulator`` from ``grasp_env`` but does 
 - a flat **collision-plane table** at z=0, aligned with the splat's real table top,
 - a **0.03175 m red cube** (1.25 in) spawned in a configurable table rectangle,
 - three cameras matching the real MCAP rig: ``low``/``side`` static and ``wrist``
-  mounted on the EE; each defaults to 640x480.
+  mounted on the EE; each defaults to 360x270 (4:3, as the real rig).
 - **physics dt vs record decimation** decoupling.
 
 Frames/axes: Genesis cameras use an OpenGL convention internally.
@@ -596,7 +596,29 @@ class StackCfg:
 class TaskEnvCfg:
     task: Literal["lift", "stack"] = "lift"
     stack: StackCfg = field(default_factory=StackCfg)
-    res: tuple[int, int] = (640, 480)
+    # 96x72: the floor, not a quality setting.
+    #
+    # crossformer's loader ends every frame at 64x64 via a plain cv2.resize
+    # (`crossformer/data/grain/loader.py:imresize`) -- a SQUASH of the full 4:3 frame, no
+    # crop. (`center_crop` exists in that file but is never called; the comment claiming a
+    # crop stage is stale.) So every pixel rendered above 64 in either axis is computed,
+    # stored, converted to arec, and then discarded at the resize. 640x480 was storing ~70x
+    # more pixels than the network ever receives.
+    #
+    # The only hard requirement is not falling BELOW 64 in either axis, which would make
+    # the pipeline upsample and lose real detail. 72 clears that with a little margin, and
+    # 4:3 is retained because these MCAPs stand in for the real rig's 4:3 logs and both
+    # must reach the network through the same transform.
+    #
+    # Measured (scripts/res_sweep.py, farthest-spawn seed where the cube is smallest on
+    # screen): the resulting 64x64 is near-identical to one rendered at 640x480 -- the
+    # residual is background aliasing, not task content.
+    #
+    # NOTE: arec image shape becomes [3, 72, 96, 3], so the schema fingerprint differs from
+    # the 640x480 `xarm_sim` build. A batch at this resolution is a NEW dataset, not an
+    # append. If training ever moves above 64px, this batch has no headroom and must be
+    # regenerated -- that is the accepted cost of ~19 GB instead of ~2 TB.
+    res: tuple[int, int] = (96, 72)
     fov_deg: float = 42.0                 # fallback vertical FOV → intrinsics
     physics_dt: float = 1.0 / 120.0       # stable sim step; ×record_every → 30 Hz like real
     record_every: int = 4                 # emit every k-th step → record_dt = physics_dt*k
@@ -1481,7 +1503,11 @@ class TaskEnv:
             out[name] = np.ascontiguousarray(rgb[..., :3]).astype(np.uint8)
         return out
 
-    STATIC_CAM_MARGIN_PX = 30.0  # ~1.5 cube widths inside the frame edge
+    # ~1.5 cube widths inside the frame edge, calibrated at 640 px wide. Scaled with the
+    # render width so the margin stays the same physical distance rather than silently
+    # becoming stricter when the resolution drops.
+    STATIC_CAM_MARGIN_PX = 30.0
+    STATIC_CAM_MARGIN_REF_W = 640.0
 
     def _spawn_visible_in_static_cams(self) -> bool:
         """Both cubes' centers project inside the low AND side frames with margin.
@@ -1493,7 +1519,7 @@ class TaskEnv:
         z = self.cfg.table.top_z + BLOCK_SIZE / 2.0
         points = [(*self.episode_spawn["red_xy"], z), (*self.episode_spawn["green_xy"], z)]
         w, h = self.res
-        m = self.STATIC_CAM_MARGIN_PX
+        m = self.STATIC_CAM_MARGIN_PX * (w / self.STATIC_CAM_MARGIN_REF_W)
         for name in ("low", "side"):
             K = self.intrinsics(name)
             w2c = np.linalg.inv(np.asarray(self.episode_extrinsics[name]))

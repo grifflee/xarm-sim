@@ -46,8 +46,11 @@ class Cfg:
     x_range: tuple[float, float] = (-0.06, 0.72)
     y_range: tuple[float, float] = (-0.31, 0.31)
     margin_px: float = 24.0
-    """How far inside the frame border the cube centre must land. A cube clipped at the
-    edge is not usefully visible, so centre-in-frame alone is too generous."""
+    """How far inside the frame border the cube centre must land, EXPRESSED AT
+    `margin_ref_w`. A cube clipped at the edge is not usefully visible, so centre-in-frame
+    alone is too generous. Scaled to the live render width so the margin stays the same
+    physical distance -- at 96 px wide a raw 24 px would be a quarter of the frame."""
+    margin_ref_w: float = 640.0
     out_dir: Path = Path("/nas/glee10/sim_mcaps/spawn_visibility")
     backend: str = "gpu"
 
@@ -77,6 +80,9 @@ def main(cfg: Cfg) -> None:
     pts = np.stack([gx.ravel(), gy.ravel(), np.full(gx.size, cube_z)], axis=1)
 
     Ks = {n: np.asarray(env.intrinsics(n), dtype=np.float64) for n in STATIC_CAMS}
+    margin = cfg.margin_px * (W / cfg.margin_ref_w)
+    print(f"render {W}x{H}, margin {margin:.1f}px (={cfg.margin_px:.0f} at "
+          f"{cfg.margin_ref_w:.0f} wide)", flush=True)
     visible = np.zeros(gx.size, dtype=np.float64)
 
     visible_any = np.zeros(gx.size, dtype=np.float64)
@@ -88,8 +94,8 @@ def main(cfg: Cfg) -> None:
             uv, z = project(pts, Ks[name], c2w)
             per_cam.append(
                 (z > 0)
-                & (uv[:, 0] >= cfg.margin_px) & (uv[:, 0] < W - cfg.margin_px)
-                & (uv[:, 1] >= cfg.margin_px) & (uv[:, 1] < H - cfg.margin_px)
+                & (uv[:, 0] >= margin) & (uv[:, 0] < W - margin)
+                & (uv[:, 1] >= margin) & (uv[:, 1] < H - margin)
             )
         # BOTH is the stack task's standard (redundancy); ANY is the weaker bar of "the
         # policy can see the cube somewhere", since it also receives the wrist view.
@@ -143,7 +149,7 @@ def main(cfg: Cfg) -> None:
     out = {
         "draws": cfg.draws,
         "pitch": cfg.pitch,
-        "margin_px": cfg.margin_px,
+        "margin_px": margin,
         "res": [W, H],
         "cube_z": cube_z,
         "x": xs.tolist(),

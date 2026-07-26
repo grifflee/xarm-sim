@@ -458,7 +458,18 @@ Simulation and toggle notes:
   pipeline. Keep the default `slab`.
 - `--env.show-viewer`: opens the Genesis viewer and requires a GUI-capable session.
 - `--env.res WIDTH HEIGHT`, `--env.physics-dt`, `--env.record-every`: low-level capture
-  shape/rate knobs. The baseline is 640x480, 1/120 s physics, `record_every=4` -> 30 Hz.
+  shape/rate knobs. The baseline is **96x72** (was 640x480 through 2026-07-25), 1/120 s
+  physics, `record_every=4` -> 30 Hz.
+  Why so small: crossformer's loader ends every frame at 64x64 with a plain `cv2.resize`
+  (`crossformer/data/grain/loader.py:imresize`) — a SQUASH of the whole 4:3 frame, no crop
+  (`center_crop` is defined in that file but never called). So anything rendered above 64
+  per axis is computed, stored, converted to arec, then discarded. The only floor is "do
+  not go below 64 in either axis", or the pipeline upsamples and loses real detail; 72
+  clears it with margin, and 4:3 is kept because these MCAPs stand in for the real rig's
+  4:3 logs. `scripts/res_sweep.py` measures this: the 64x64 the network receives is
+  near-identical whether rendered at 96x72 or 640x480. Cost: ~0.83 MB/episode instead of
+  ~82 MB. **Known mismatch:** mhyatt square-crops real images at inference while training
+  squashes — ask before assuming either side is correct.
 
 Tyro maps dataclass fields to CLI flags with hyphens and nested dataclasses with dots,
 for example `TaskEnvCfg.render_backend` becomes `--env.render-backend` and
