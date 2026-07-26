@@ -435,6 +435,27 @@ Simulation and toggle notes:
   shadow attenuation; compositing applies that softened mask to the original splat
   pixels and discards the receiver. Defaults approved by grifflee on 2026-07-23 are
   strength 0.45 and blur sigma 3 px. See `docs/BATCH_SHADOW_CATCHER.md`.
+- `--env.batch-light-dir-jitter-deg` / `--env.batch-light-intensity-jitter` /
+  `--env.batch-shadow-strength-jitter`: per-episode lighting variation on the `batch` path.
+  All default to 0 (the single fixed condition every approved batch was generated under,
+  including the 10,500-episode baseline). Recipe: `12`, `0.25`, `0.15`. This does NOT route
+  through `_run_appearance_subprocess_batch` — the rig is mutable after `scene.build()`
+  (~1 ms/episode, no rebuild), unlike the `nyx_*` appearance knobs. The draws happen last
+  in `reset()`, so cube/camera/drop/arm-start streams for a given seed are unchanged
+  (verified byte-identical with the jitters off). Recorded per episode in `manifest.json`
+  under `lights` and `shadow_strength`.
+  **What each buys:** direction moves where the arm's shadow FALLS, `batch_shadow_strength`
+  jitter changes how DARK it is (it was a fixed 0.45 in every episode ever generated —
+  shadow darkness is not a function of light intensity, see `_composite_splat`), and
+  intensity changes how the robot is lit (least valuable; the white arm already clips 27%
+  of its lit pixels at the nominal key).
+- **Physical bounds are enforced in code, not by the default magnitudes being small.** The
+  lab is lit from the ceiling, so `batch_light_min_elevation_deg` (default 30) clamps every
+  jittered light to at least that many degrees below horizontal — light from the side walls
+  or from below is unreachable at ANY jitter magnitude (verified at 60°). Shadow strength is
+  clamped to `BATCH_SHADOW_STRENGTH_LIMITS = (0.0, 0.65)`: 0 is a real diffused-ceiling
+  condition, but a pure-black umbra needs a lone point source in an unlit black room. Do not
+  widen either bound without a physical argument.
 - `--env.nyx-spp N`: Nyx samples per pixel. Default is 8; increasing it costs time.
 - `--env.splat-uri PATH`: defaults to `assets/lab_aligned.ply`, the byte-identical
   `assets-v1` release asset (328,002,116 bytes; md5

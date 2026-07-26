@@ -713,6 +713,11 @@ def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict
         # (camera_info + /tf) via log_calibration
         "extrinsics": {k: np.asarray(v).tolist() for k, v in env.episode_extrinsics.items()},
         "appearance": env.episode_appearance,
+        # the episode's actual Madrona key/fill rig; empty list when light jitter is off
+        "lights": env.episode_lights,
+        # fraction of the lit tabletop removed inside the arm's shadow (fixed 0.45 unless
+        # batch_shadow_strength_jitter is on)
+        "shadow_strength": float(env.episode_shadow_strength),
         "spawn": env.episode_spawn,
         "arm_start": env.episode_arm_start,
     }

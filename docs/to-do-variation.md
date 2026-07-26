@@ -20,7 +20,7 @@ all, and it is the baseline every randomization experiment below gets compared a
 | arm start | 4-bucket mixture, below |
 | camera pose | ±15° / ±5 cm jitter on low + side, per episode |
 | episode tempo | 0.85–1.30× segment timing |
-| **lighting** | **none — fixed** |
+| **lighting** | **none — fixed** (per-episode jitter now EXISTS but is off by default; see item 1) |
 | **cube/robot appearance** | **none — fixed** |
 | **physics (mass, friction)** | **none — fixed** |
 | **actuation noise** | **none — perfect execution** |
@@ -41,11 +41,12 @@ at power-on. Candidate: drop to ~0.02 or redistribute into `post_drop`/`broad`.
 
 ## Two structural blockers found 2026-07-26
 
-**Lighting cannot vary on the `batch` path at all.** `src/xsim/batch_renderer.py`'s
+**Lighting cannot vary on the `batch` path at all.** ~~`src/xsim/batch_renderer.py`'s
 `BatchConfig` hardcodes the Madrona rig — key 1.7, fill 0.85, fixed directions, no RNG. The
 `nyx_light_*_jitter` config fields feed `_sample_appearance` for the **Nyx** renderer only.
 Production uses `batch`. So the most obvious visual domain gap is currently un-randomizable
-without code.
+without code.~~ **RESOLVED 2026-07-26 — see item 1 below.** The rig turned out to be
+mutable after `scene.build()`, so this is per-episode and free; no rebuild, no subprocess.
 
 **Appearance randomization as built is prohibitively expensive.** Setting any
 `APPEARANCE_JITTER_FIELDS` routes generation through
@@ -55,11 +56,68 @@ the approved stack appearance recipe (2026-07-07) was only ever used on small ba
 
 ## Prioritised work
 
-### 1. Jitter the Madrona light rig — highest value, cheapest
+### 1. Jitter the Madrona light rig — DONE 2026-07-26 (off by default)
 Per-episode jitter on `BatchConfig`'s two lights: direction ±10–15°, intensity ±25%. Passed
 into the existing rig at reset, so **no subprocess and no scene rebuild** — free at
 generation time. The lab's lighting changes with time of day and the model has so far seen
 exactly one lighting condition. Close this first.
+
+Implemented as `--env.batch-light-dir-jitter-deg 12 --env.batch-light-intensity-jitter 0.25
+--env.batch-shadow-strength-jitter 0.15` (all default 0 = the baseline rig, bit-for-bit).
+Recorded per episode in the manifest under `lights` and `shadow_strength`.
+
+**The axis that matters is table shadows, not robot brightness** (grifflee, 2026-07-26).
+Direction jitter moves where the arm's shadow falls; `batch_shadow_strength_jitter` changes
+how dark it is. That second one was the real gap: shadow darkness is *not* a function of
+light intensity at all — `_composite_splat` renders the shadow SHAPE with Madrona and then
+attenuates the baked splat tabletop by the fixed `batch_shadow_strength`, so every shadow in
+every episode ever generated is exactly 45% dark. Intensity jitter is the least valuable of
+the three (the white arm already clips 27% of its lit pixels at the nominal key).
+
+**Physical bounds are enforced in code, not by the defaults being small.** The lab is lit
+from the ceiling, so `batch_light_min_elevation_deg` (default 30°) clamps every jittered
+light to at least that far below horizontal — verified at an absurd ±60° jitter, 40,000
+draws, min elevation exactly 30.000° and nothing at or below the horizon. Shadow strength is
+clamped to `BATCH_SHADOW_STRENGTH_LIMITS = (0.0, 0.65)`; 0 is a real fully-diffused ceiling,
+but a pure-black umbra requires a lone point source in an unlit black room.
+
+**The premise that the rig is frozen at construction was wrong, and the reason is worth
+knowing.** `scene.add_light` is `@gs.assert_unbuilt` and `_add_cameras()` runs once, which
+makes the rig *look* baked. It is not. Genesis' `BatchRenderer` keeps the lights as a plain
+Python list, and `MadronaBatchRendererAdapter.init()` memcpys them into the `LightEntity` ECS
+columns and re-runs Madrona's **RenderInit** task graph. The light entities themselves are
+created in the `Sim` world constructor (`gs_madrona/src/bridge/sim.cpp`), *not* in a task
+graph, so `init()` is re-entrant: it only sorts, copies and re-packs. Measured 1.1 ms per
+call, zero GPU allocation growth over 60 calls, and restoring the nominal rig reproduces the
+original frames pixel-for-pixel.
+
+The trap to avoid: writing the exported light columns alone renders nothing new.
+`lightUpdate` is only added to the graph when `update_visual_properties` is true
+(`gs_madrona/src/render/ecs_system.cpp`), which holds for RenderInit but **not** for the
+per-frame Render graph. `init()` is the only Python-reachable way to run it.
+
+Known asymmetry, measured: the white xArm already clips 27% of its lit pixels at the nominal
+key of 1.7, so +25% intensity buys mostly more clipping (41%) while −25% recovers shading
+detail. If this wants widening later, widen the dark side or lower the key — don't raise it.
+This constrains robot brightness only; shadows are dark regions and never clip.
+
+**Blocker found while verifying the shadows — needs grifflee, no code changed.**
+`batch_shadow_blur_px = 3.0` is an absolute pixel count tuned and approved at 640x480. The
+2026-07-26 drop to 96x72 made it 6.7x wider relative to the frame, and it now smears the
+shadow it is meant to soften. Same pose (seed 9002 step 150, side cam) at strength 0.45,
+deepest tabletop darkening:
+
+| render | blur | deepest | table below 0.85x |
+|---|---|---|---|
+| 640x480 | 3.00 px | 0.78x | 3.9% | (the approved look) |
+| **96x72** | **3.00 px** | **0.84x** | **0.1%** | (production today) |
+| 96x72 | 0.45 px | 0.67x | 4.6% | (res-scaled, restores it) |
+
+So current 96x72 batches carry a markedly flatter shadow than the one signed off on
+2026-07-23. The fix is to scale it with render width exactly as `STATIC_CAM_MARGIN_PX`
+already does (that constant keeps an explicit `STATIC_CAM_MARGIN_REF_W = 640.0` for this
+reason), but it changes an approved visual, so it is flagged rather than applied.
+Panel: `outputs/sim_preview/batch_shadow_blur_resolution.png`.
 
 ### 2. Physics randomization — does not exist at all
 No mass or friction jitter anywhere; the cube is always `friction=2.0` and one mass. For a

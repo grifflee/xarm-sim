@@ -29,7 +29,7 @@ import gs_nyx.nyx_py_renderer as npr
 import gs_nyx.nyx_py_sdk as nps
 from gs_nyx_plugin.nyx_camera_options import NyxCameraOptions
 
-from xsim.batch_renderer import BatchConfig
+from xsim.batch_renderer import BatchConfig, BatchLight, jitter_lights, light_elevation_deg
 from xsim.grasp_env import Manipulator, ROBOT_VISUAL_MATERIALS, _robot_material_name, _set_vgeom_surface
 from xsim.splat_bg import SplatAsset, SplatBackground, T_GL_TO_CV, invert_rigid, viewmats_cv
 
@@ -42,6 +42,14 @@ DEFAULT_SPLAT_PATH = PROJECT_ROOT / "assets" / "lab_aligned.ply"
 BLOCK_SIZE = 0.03175  # 1.25 inch cube edge (m)
 BLOCK_COLOR = (0.48, 0.05, 0.04)  # saturated red; brighter albedos wash to salmon under the nyx light
 DEFAULT_NYX_LIGHT_DIR = (-0.4, -0.4, -0.8)
+# Plausible band for a per-episode shadow-strength draw, as a fraction of the lit
+# tabletop removed inside the umbra. Deliberately a module constant and not a config
+# field: it is a statement about how rooms work, not a tuning knob, and a jitter
+# magnitude someone types on the command line must not be able to escape it. 0.0 is a
+# real condition (fully diffused ceiling, no visible shadow); 1.0 is not (pure black
+# umbra needs a lone point source in an unlit black room, and any lit lab bounces
+# enough light off walls and bench to fill it). See batch_shadow_strength_jitter.
+BATCH_SHADOW_STRENGTH_LIMITS = (0.0, 0.65)
 DEFAULT_NYX_CEILING_LIGHT_X = (0.05, 0.75)
 DEFAULT_NYX_CEILING_LIGHT_Y = (-0.30, 0.30)
 DEFAULT_NYX_CEILING_LIGHT_Z = 1.85
@@ -699,7 +707,40 @@ class TaskEnvCfg:
     # attenuation onto the splat pixels during compositing.
     batch_shadow_catcher: bool = True
     batch_shadow_strength: float = 0.45
+    # Per-episode ADDITIVE jitter around batch_shadow_strength (0 = off, the fixed 0.45
+    # every batch so far). Shadow darkness is the axis grifflee actually wants varied:
+    # batch_light_dir_jitter_deg moves where the shadow falls, but its darkness is this
+    # one constant, so every shadow in every episode we have generated is exactly 45%.
+    #
+    # 0.15 is the magnitude to USE, giving 0.30..0.60. It STRADDLES 0.45 rather than
+    # replacing it: 0.45 was approved by grifflee on 2026-07-23 from a labelled
+    # before/after video and stays the centre of the distribution.
+    #
+    # Physical bounds, enforced by BATCH_SHADOW_STRENGTH_LIMITS below, not by this
+    # magnitude being small: 0.0 is a shadowless scene, which is what a fully overcast
+    # or heavily diffused ceiling gives you and is perfectly real. The far end is the
+    # one that lies. 1.0 means the tabletop inside the shadow goes to pure black, which
+    # requires a single point source in an otherwise unlit black room -- a lit lab
+    # always has bounce off walls, ceiling and bench filling the umbra. 0.65 keeps the
+    # darkest shadow at ~35% of the lit tabletop, which is already a hard, contrasty
+    # shadow for an indoor room and is as far as this can go and stay honest.
+    batch_shadow_strength_jitter: float = 0.0
+    # Shadow softening, expressed AT batch_shadow_blur_ref_w and scaled to the live render
+    # width -- so it stays the same *fraction of the frame* at any resolution.
+    #
+    # It was an absolute pixel count until 2026-07-26. 3.0 px was tuned and approved at
+    # 640x480; when the pipeline dropped to 96x72 it became 6.7x wider relative to the frame
+    # and smeared away the shadow it exists to soften. Same pose (seed 9002 step 150, side
+    # cam), strength 0.45, deepest tabletop darkening:
+    #   640x480 blur 3.00 -> 0.78x, 3.9% of the table below 0.85x   (the approved look)
+    #    96x72  blur 3.00 -> 0.84x, 0.1% below 0.85x                (the bug)
+    #    96x72  blur 0.45 -> 0.67x, 4.6% below 0.85x                (scaled, restores it)
+    # The 10,500-episode batch of 2026-07-26 was generated under the bug and carries a
+    # markedly flatter table shadow than the one approved on 2026-07-23.
+    # Third resolution-dependent constant found in this file; see STATIC_CAM_MARGIN_REF_W.
+    # Panel: outputs/sim_preview/batch_shadow_blur_resolution.png
     batch_shadow_blur_px: float = 3.0
+    batch_shadow_blur_ref_w: float = 640.0
     splat_bg: bool = True
     splat_uri: Path | None = DEFAULT_SPLAT_PATH
     splat_pos: tuple[float, float, float] | None = (0.0, 0.0, 0.0)
@@ -733,6 +774,60 @@ class TaskEnvCfg:
     # uniformly per episode (real lab shows little shadow -> bias low).
     nyx_shadow_strength: float = 1.0
     nyx_shadow_strength_range: tuple[float, float] | None = None
+    # Per-episode jitter of the Madrona key/fill rig (batch backend only), drawn once at
+    # reset and pushed straight into the live renderer. Unlike the nyx_* appearance knobs
+    # above, these do NOT force a per-episode scene rebuild -- see `_apply_batch_lights`
+    # for why the rig turns out to be mutable after build. ~1 ms per episode.
+    #
+    # 12 deg / 0.25 are the magnitudes to USE; both default to 0 because until now the
+    # batch path had exactly one lighting condition, and the 10,500-episode baseline must
+    # stay bit-reproducible (verified: with these at 0, frames are pixel-identical to the
+    # pre-jitter code, and the cube/camera/drop/arm streams are untouched because the
+    # light draw is last in reset()).
+    #
+    # Why these numbers: the cell's overhead fixtures do not move, so what actually varies
+    # between sessions is incidence angle from daylight and which lamps are on -- a modest
+    # tilt and a real change in level, not a new rig.
+    #
+    # Measured at 96x72, seed 9000, low cam, over the 684 Madrona-lit (mesh) pixels:
+    #   intensity x0.75 -> mesh mean 150.9   x1.0 -> 163.5   x1.25 -> 169.9
+    # The response is ASYMMETRIC and the useful half is downward: the xArm is white and
+    # already renders 27% of its pixels at >=250 under the nominal rig, so up-jitter
+    # mostly buys more clipping (41% at x1.25) for +6 levels of mean, while down-jitter
+    # buys -13 levels and recovers shading detail (10% clipped at x0.75). Going past
+    # +/-25% therefore adds little on the bright side; if this needs widening later,
+    # widen the dark side or lower the 1.7 key in BatchConfig rather than raising it.
+    #
+    # 12 deg is a tilt of the direction vector, not a per-axis Euler wobble, so it is the
+    # realized angular change (see jitter_lights). It moves the cast shadow enough to
+    # matter -- individual pixels swing by up to 192 levels at a shadow edge -- while
+    # keeping the key roughly overhead. Over 12 pure-lighting draws at fixed geometry the
+    # lit-pixel mean spanned 124.6-155.1 (std 7.9) with no frame going black or blowing
+    # out (whole-frame fraction <=5 unchanged at 3.77%, >=250 3.30% -> 3.36%).
+    #
+    # NOTE ON PRIORITIES: the brightness numbers above constrain how the ROBOT is lit,
+    # which is the axis grifflee cares least about. The point of the direction jitter is
+    # where the arm's shadow lands on the table. Shadows are dark regions and never clip,
+    # so the clipping ceiling does not limit the thing we are actually buying here. Their
+    # DARKNESS is a separate knob entirely -- see batch_shadow_strength_jitter.
+    batch_light_dir_jitter_deg: float = 0.0
+    batch_light_intensity_jitter: float = 0.0  # multiplicative +/- fraction per light
+    # Hard floor on how shallow a jittered light may end up, in degrees below horizontal
+    # (0 = horizontal, 90 = straight down). Applied unconditionally in jitter_lights, so
+    # the bound holds at ANY jitter magnitude rather than depending on the default being
+    # small -- an operator raising the jitter to 60 deg must still not be able to
+    # manufacture light arriving from the side walls or from underneath the table.
+    #
+    # This lab is lit from the CEILING. Data showing horizontal or upward light is not
+    # merely unusual, it is a world the real cell cannot produce, and it is worse than no
+    # variation at all for a pipeline whose entire purpose is sim2real.
+    #
+    # 30 deg: the nominal rig sits at 54.7 (key) and 45.8 (fill), so at the recommended
+    # +/-12 the fill's own floor is 33.8 and the clamp is inactive in normal use -- it is
+    # a guard rail, not a shaper of the default distribution. 30 is set just under that
+    # so the recommended recipe is unaffected, while still being a defensible "low winter
+    # sun through a window" limit. Anything shallower reads as wall-mounted light.
+    batch_light_min_elevation_deg: float = 30.0
     robot_roughness_jitter: float = 0.0      # multiplicative +/- fraction; lower roughness = shinier
     cube_hue_jitter_deg: float = 0.0
     cube_value_jitter: float = 0.0           # multiplicative +/- fraction in HSV value
@@ -879,6 +974,12 @@ class TaskEnv:
         self._splat_bg_frames: dict[str, np.ndarray] = {}
         self._splat_steps = 0
         self._render_stale = False
+        # the rig installed at build and the center of every episode's jitter draw.
+        # Held on the instance so reset() perturbs the ORIGINAL rig each episode rather
+        # than compounding jitter on top of the previous episode's draw.
+        self._batch_lights_nominal = BatchConfig(use_rasterizer=self.cfg.use_rasterizer).lights
+        self.episode_lights: list[dict] = []
+        self.episode_shadow_strength = float(self.cfg.batch_shadow_strength)
         self._add_cameras()
 
         self.scene.build(n_envs=1)
@@ -1078,7 +1179,7 @@ class TaskEnv:
         if self.cfg.render_backend == "batch":
             # Madrona ignores Genesis scene lights; without this explicit rig the
             # foreground is near-black before splat compositing.
-            for light in BatchConfig(use_rasterizer=self.cfg.use_rasterizer).lights:
+            for light in self._batch_lights_nominal:
                 self.scene.add_light(
                     pos=light.position,
                     dir=light.direction,
@@ -1088,6 +1189,101 @@ class TaskEnv:
                     cutoff=45.0,
                     intensity=light.intensity,
                 )
+
+    def _apply_batch_lights(self, lights: tuple[BatchLight, ...]) -> None:
+        """Push a light rig into the live Madrona renderer, after scene.build().
+
+        `scene.add_light` is @assert_unbuilt, so the rig looks frozen at construction,
+        but it is not: Genesis' BatchRenderer keeps the lights as a plain list and the
+        Madrona adapter's `init()` memcpys them into the LightEntity ECS columns and
+        re-runs the RenderInit task graph. RenderInit is the only graph that carries
+        `lightUpdate` (the Render graph is built with update_mats=False), so writing the
+        columns alone would render nothing new -- init() is what makes a change visible.
+        It is re-entrant: the light entities are created once in the Sim world
+        constructor, and init() only sorts, copies and re-packs. Measured at ~1.1 ms per
+        call with no GPU allocation growth over 60 calls.
+        """
+        # module-private helpers: there is no public Genesis entry point for re-lighting
+        # a built scene, so we mirror exactly what BatchRenderer.build() does.
+        from genesis.vis.batch_renderer import _make_tensor, _transform_camera_quat
+
+        br = self.scene.visualizer.batch_renderer
+        br.lights.clear()
+        for light in lights:
+            br.add_light(
+                pos=light.position,
+                dir=light.direction,
+                color=light.color,
+                intensity=light.intensity,
+                directional=True,
+                castshadow=light.castshadow,
+                cutoff=45.0,
+                attenuation=0.0,
+            )
+        cams = br.cameras
+        br._renderer.init(
+            cam_pos_tensor=torch.stack([torch.atleast_2d(c.get_pos()) for c in cams], dim=1),
+            cam_rot_tensor=_transform_camera_quat(
+                torch.stack([torch.atleast_2d(c.get_quat()) for c in cams], dim=1)
+            ),
+            lights_pos_tensor=_make_tensor([l.pos for l in br.lights]).reshape((-1, 3)),
+            lights_dir_tensor=_make_tensor([l.dir for l in br.lights]).reshape((-1, 3)),
+            lights_rgb_tensor=_make_tensor([l.color for l in br.lights]).reshape((-1, 3)),
+            lights_directional_tensor=_make_tensor([l.directional for l in br.lights], dtype=torch.bool),
+            lights_castshadow_tensor=_make_tensor([l.castshadow for l in br.lights], dtype=torch.bool),
+            lights_cutoff_tensor=_make_tensor([l.cutoffRad for l in br.lights]),
+            lights_attenuation_tensor=_make_tensor([l.attenuation for l in br.lights]),
+            lights_intensity_tensor=_make_tensor([l.intensity for l in br.lights]),
+        )
+
+    def _randomize_lighting(self, rng: np.random.Generator) -> None:
+        """Re-light the batch renderer for this episode and record what was drawn.
+
+        Two independent axes, both off by default: where the arm's shadow FALLS (the
+        light rig) and how dark it is (the shadow-catcher transfer strength). Lights are
+        drawn before shadow strength; keep that order, it is part of the seed contract.
+        """
+        self.episode_lights = []
+        self.episode_shadow_strength = float(self.cfg.batch_shadow_strength)
+        if self.cfg.render_backend != "batch":
+            return  # nyx bakes its lights at export; raster has no rig or catcher
+
+        if self.cfg.batch_light_dir_jitter_deg > 0.0 or self.cfg.batch_light_intensity_jitter > 0.0:
+            if self.cfg.batch_light_dir_jitter_deg > 0.0 and self.cfg.batch_light_min_elevation_deg <= 0.0:
+                # A floor at or below the horizon would let a draw put the fixture level
+                # with, or under, the table. The lab is lit from the ceiling; there is no
+                # setting of this pipeline that should be able to claim otherwise.
+                raise ValueError(
+                    "batch_light_min_elevation_deg must be > 0 when light direction jitter is on "
+                    f"(got {self.cfg.batch_light_min_elevation_deg!r}); light may not come from "
+                    "the side walls or from below"
+                )
+            lights = jitter_lights(
+                self._batch_lights_nominal,
+                rng,
+                self.cfg.batch_light_dir_jitter_deg,
+                self.cfg.batch_light_intensity_jitter,
+                self.cfg.batch_light_min_elevation_deg,
+            )
+            # No re-init when jitter is off: the rig is already the nominal one from
+            # build, so touching the renderer there could only introduce drift.
+            self._apply_batch_lights(lights)
+            self.episode_lights = [
+                {
+                    "direction": [float(v) for v in light.direction],
+                    "intensity": float(light.intensity),
+                    "elevation_deg": float(light_elevation_deg(light.direction)),
+                    "castshadow": bool(light.castshadow),
+                }
+                for light in lights
+            ]
+
+        if self.cfg.batch_shadow_strength_jitter > 0.0:
+            lo, hi = BATCH_SHADOW_STRENGTH_LIMITS
+            delta = float(rng.uniform(-1.0, 1.0)) * self.cfg.batch_shadow_strength_jitter
+            self.episode_shadow_strength = float(
+                np.clip(self.cfg.batch_shadow_strength + delta, lo, hi)
+            )
 
     def _place_cube(self, cube, x: float, y: float, yaw: float) -> None:
         z = self.cfg.table.top_z + BLOCK_SIZE / 2.0
@@ -1340,6 +1536,10 @@ class TaskEnv:
         else:
             raise ValueError(f"unknown arm_start_mode: {self.cfg.arm_start_mode!r}")
         self._sync_attached_cams()
+        # Lighting draws go after the arm draws, i.e. dead last in the stream, so every
+        # seed's cube/camera/drop/joint values are identical to the pre-lighting batches.
+        # With all the jitter magnitudes at 0 nothing is drawn at all.
+        self._randomize_lighting(rng)
         self._splat_steps = 0
         self._render_splat_bg()
         self._render_stale = True
@@ -1514,12 +1714,17 @@ class TaskEnv:
             return out
         shadow = np.zeros_like(luma, dtype=np.float32)
         shadow[catcher] = 1.0 - np.clip(luma[catcher] / reference, 0.0, 1.0)
-        sigma = max(0.0, float(self.cfg.batch_shadow_blur_px))
+        # scale to the live render width: the tuned value is expressed at the reference
+        # width, so the softening stays a constant fraction of the frame at any resolution
+        sigma = max(0.0, float(self.cfg.batch_shadow_blur_px)
+                    * (self.res[0] / max(1.0, float(self.cfg.batch_shadow_blur_ref_w))))
         if sigma > 0.0:
             weights = cv2.GaussianBlur(catcher.astype(np.float32), (0, 0), sigma)
             shadow = cv2.GaussianBlur(shadow, (0, 0), sigma) / np.maximum(weights, 1e-6)
             shadow[~catcher] = 0.0
-        strength = float(np.clip(self.cfg.batch_shadow_strength, 0.0, 1.0))
+        # episode value, not cfg: equals cfg.batch_shadow_strength unless this episode
+        # drew a shadow-strength jitter (which is already clamped to the plausible band)
+        strength = float(np.clip(self.episode_shadow_strength, 0.0, 1.0))
         factor = np.clip(1.0 - strength * shadow, 0.0, 1.0)
         shadowed_bg = np.clip(bg.astype(np.float32) * factor[..., None], 0.0, 255.0).astype(np.uint8)
         out[catcher] = shadowed_bg[catcher]
