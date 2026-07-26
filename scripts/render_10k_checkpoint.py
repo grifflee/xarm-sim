@@ -49,6 +49,105 @@ class Config:
     video_fps: float = 30.0
     reset_only: bool = False
 
+    seed_start: int | None = None
+    """Base seed for the pool/sequential modes. None keeps the curated CASES."""
+
+    select_pool: int = 0
+    """If >0, probe this many resets from `seed_start` (cheap: reset + policy plan, no
+    render) and SELECT `n_seeds` of them by measured state. 0 = plain sequential range."""
+
+    n_seeds: int = 100
+    n_featured: int = 10
+    """Reviewers do a smell test, not an audit. The first `n_featured` renders are ordered
+    to span the distribution deliberately -- neutral/typical draws first, then the edges --
+    so watching only those is a fair sample. Filenames are rank-prefixed, so sorted order
+    is review order."""
+
+    label_prefix: str = "ep"
+    sheet_rows: int = 10
+    """Cases per contact sheet (2 tiles/row), so a 100-seed run emits readable sheets
+    rather than one 12000px image."""
+
+
+def _probe(env, base, cfg: Config) -> list[dict]:
+    """Measured reset state per seed. No rendering, so this is cheap enough to scan a
+    pool far larger than we intend to render."""
+    rows = []
+    for i in range(cfg.select_pool):
+        seed = cfg.seed_start + i
+        env.reset(seed=seed)
+        policy = _make_policy(env, base)
+        policy.reset()
+        spawn = env.episode_spawn
+        rows.append({
+            "seed": seed,
+            "radius": float(spawn["radius"]),
+            "x": float(spawn["red_xy"][0]),
+            "y": float(spawn["red_xy"][1]),
+            "bucket": env.episode_arm_start.get("bucket", "unknown"),
+            "approach": float(policy.approach_distance),
+        })
+    return rows
+
+
+def _select(rows: list[dict], cfg: Config) -> list[tuple[str, int]]:
+    """Featured smell-test set first, then a stratified fill.
+
+    Featured deliberately leads with NEUTRAL draws: an approval reel made only of corner
+    cases misrepresents what 10,000 episodes actually look like.
+    """
+    by = lambda key, rev=False: sorted(rows, key=lambda r: r[key], reverse=rev)
+    med_r = sorted(r["radius"] for r in rows)[len(rows) // 2]
+
+    def typical(bucket: str) -> dict | None:
+        cand = [r for r in rows if r["bucket"] == bucket]
+        if not cand:
+            return None
+        return min(cand, key=lambda r: (abs(r["radius"] - med_r), abs(r["y"])))
+
+    far_rows = [r for r in rows if r["bucket"] == "far"]
+    featured: list[tuple[str, dict | None]] = [
+        # three neutral draws first -- a reel of only corner cases misrepresents the batch
+        ("neutral_home", typical("home")),
+        ("neutral_post_drop", typical("post_drop")),
+        ("neutral_broad", typical("broad")),
+        # the far bucket is 25% of starts and is what "arm begins fully extended, reaching
+        # back toward the base" looks like; an earlier revision of this list omitted it
+        # entirely, so no featured video showed an extended start.
+        ("far_start_backward", max(far_rows, key=lambda r: r["approach"]) if far_rows else None),
+        ("nearest_spawn", by("radius")[0]),
+        ("farthest_spawn", by("radius", True)[0]),
+        ("positive_y_edge", by("y", True)[0]),
+        ("negative_y_edge", by("y")[0]),
+        ("closest_forward_x", by("x")[0]),  # spawns are front-only now; no beside-base case
+        ("longest_approach", by("approach", True)[0]),
+    ]
+
+    picked: list[tuple[str, int]] = []
+    seen: set[int] = set()
+    for label, row in featured[: cfg.n_featured]:
+        if row is not None and row["seed"] not in seen:
+            picked.append((label, row["seed"]))
+            seen.add(row["seed"])
+
+    # Fill: stratify by arm-start bucket in its observed proportion, spreading each
+    # bucket's picks evenly over its radius range so the fill is not all mid-table.
+    remaining = [r for r in rows if r["seed"] not in seen]
+    need = max(0, cfg.n_seeds - len(picked))
+    buckets: dict[str, list[dict]] = {}
+    for r in remaining:
+        buckets.setdefault(r["bucket"], []).append(r)
+    for name, group in buckets.items():
+        share = round(need * len(group) / max(1, len(remaining)))
+        group.sort(key=lambda r: r["radius"])
+        if share <= 0:
+            continue
+        step = max(1, len(group) // share)
+        for r in group[::step][:share]:
+            picked.append((f"{name}_r{r['radius']:.3f}".replace(".", "p"), r["seed"]))
+
+    return picked[: cfg.n_seeds]
+
 
 def main(cfg: Config) -> None:
     if cfg.render_backend not in ("raster", "nyx", "batch"):
@@ -66,7 +165,20 @@ def main(cfg: Config) -> None:
     metadata = []
     tiles = []
 
-    for label, seed in CASES:
+    if cfg.select_pool > 0:
+        if cfg.seed_start is None:
+            raise ValueError("--select-pool requires --seed-start")
+        print(f"probing {cfg.select_pool} resets from {cfg.seed_start} ...", flush=True)
+        cases = _select(_probe(env, base, cfg), cfg)
+        print(f"selected {len(cases)}; first {cfg.n_featured} are the review set")
+    elif cfg.seed_start is not None:
+        cases = [(f"{cfg.label_prefix}{i:03d}", cfg.seed_start + i) for i in range(cfg.n_seeds)]
+    else:
+        cases = list(CASES)
+
+    for rank, (label, seed) in enumerate(cases):
+        # rank prefix so sorted order == review order; the featured set sorts first
+        label = f"{rank:03d}_{label}"
         env.reset(seed=seed)
         policy = _make_policy(env, base)
         policy.reset()
@@ -90,14 +202,20 @@ def main(cfg: Config) -> None:
         tiles.append(cv2.resize(sheet, (960, 240), interpolation=cv2.INTER_AREA))
 
         video_path = None
+        res = {}
         if not cfg.reset_only:
             video_path = cfg.out_dir / f"{label}_seed{seed}_{cfg.render_backend}.mp4"
             run_cfg = replace(base, seed=seed, video_path=video_path)
-            run_video(env, run_cfg)
+            res = run_video(env, run_cfg) or {}
         metadata.append(
             {
                 "label": label,
                 "seed": seed,
+                "featured": rank < cfg.n_featured,
+                "success": res.get("success"),
+                "delivered": res.get("delivered"),
+                "close_xy_err": res.get("close_xy_err"),
+                "abort_reason": res.get("abort_reason"),
                 "video": str(video_path) if video_path is not None else None,
                 "reset_png": str(reset_path),
                 "spawn": env.episode_spawn,
@@ -107,11 +225,20 @@ def main(cfg: Config) -> None:
             }
         )
 
+    tag = "" if cfg.seed_start is None else f"_{cases[0][1]}_{cases[-1][1]}"
     rows = [np.concatenate(tiles[i : i + 2], axis=1) for i in range(0, len(tiles), 2)]
-    _save_rgb_png(cfg.out_dir / "checkpoint_contact_sheet.png", np.concatenate(rows, axis=0))
-    (cfg.out_dir / "checkpoint_cases.json").write_text(json.dumps(metadata, indent=2))
+    per_sheet = max(1, cfg.sheet_rows)
+    sheets = []
+    for n, i in enumerate(range(0, len(rows), per_sheet)):
+        suffix = "" if len(rows) <= per_sheet else f"_{n:02d}"
+        path = cfg.out_dir / f"checkpoint_contact_sheet{tag}{suffix}.png"
+        _save_rgb_png(path, np.concatenate(rows[i : i + per_sheet], axis=0))
+        sheets.append(path.name)
+    (cfg.out_dir / f"checkpoint_cases{tag}.json").write_text(json.dumps(metadata, indent=2))
     kind = "reset cases" if cfg.reset_only else "videos"
-    print(f"wrote {len(metadata)} {kind} + checkpoint_contact_sheet.png to {cfg.out_dir}")
+    n_ok = sum(1 for m in metadata if m.get("success"))
+    print(f"wrote {len(metadata)} {kind} ({n_ok} success) + {len(sheets)} contact "
+          f"sheet(s) to {cfg.out_dir}")
 
 
 if __name__ == "__main__":
