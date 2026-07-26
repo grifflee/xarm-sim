@@ -39,6 +39,12 @@ linked every manifest episode including success-gated deletions. Never seen beca
 batch_v3 was 100/100. Fixed; it now skips non-kept episodes and records them under
 `dropped`.
 
+**Running a batch: `docs/GENERATION_RUNBOOK.md`.** Launch (tmux), the ~10 min supervision
+cycle, how to read success/failure (NOT from the logs — from gaps in the episode filename
+sequence, since failures are deleted), which signals lie, extending a batch in place, the
+finish sequence, and recovery. Read it before launching; the traps section will save you
+from trusting `eps=0/10500 rate=100.0%`.
+
 **Second machine (luc, 4x L40S):** `scripts/run_shards.py` is the sharded supervisor —
 guards on TOTAL machine pressure (system MemAvailable, total per-GPU VRAM), not just our
 own, because a shared box dying is equally fatal whoever caused it. 8 shards cost only +12%
