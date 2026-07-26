@@ -671,6 +671,11 @@ class TaskEnvCfg:
     arm_start_broad_radius: tuple[float, float] = (0.20, 0.58)
     arm_start_broad_heading_deg: tuple[float, float] = (-49.0, 49.0)
     arm_start_broad_z: tuple[float, float] = (0.02, 0.35)
+    # Start TCPs must sit over the table, inset by this margin. The far/broad buckets
+    # sample radius x heading with no table awareness and would otherwise park the arm out
+    # over the floor beside the table (measured 4.5% of starts, up to 7.5 cm past the
+    # edge). 0 disables the check and restores the pre-2026-07-26 behaviour.
+    arm_start_table_margin: float = 0.03
     table: TableCfg = field(default_factory=TableCfg)
     base_decor: BaseDecorCfg = field(default_factory=BaseDecorCfg)
     table_mode: Literal["slab", "plane"] = "slab"  # plane = visible infinite tabletop, no finite cart slab
@@ -1138,6 +1143,15 @@ class TaskEnv:
             "cumulative_fallbacks": self.arm_start_fallbacks,
         }
 
+    def _tcp_over_table(self, tcp: np.ndarray) -> bool:
+        """Is this start TCP above the table footprint (inset by a margin)?"""
+        t = self.cfg.table
+        m = self.cfg.arm_start_table_margin
+        return (
+            t.center_xy[0] - t.size_xy[0] / 2 + m <= float(tcp[0]) <= t.center_xy[0] + t.size_xy[0] / 2 - m
+            and abs(float(tcp[1])) <= t.size_xy[1] / 2 - m
+        )
+
     def _sample_arm_start_tcp(self, rng: np.random.Generator, bucket: str) -> np.ndarray:
         if bucket == "post_drop":
             return np.array(
@@ -1185,6 +1199,14 @@ class TaskEnv:
         for attempt in range(1, max(1, self.cfg.arm_start_max_tries) + 1):
             target = self._sample_arm_start_tcp(rng, bucket)
             last_target = target
+            # The far/broad buckets sample by radius and heading with no notion of the
+            # table, so r=0.58 at +-49deg puts the TCP up to 13 cm BEYOND the table edge --
+            # the arm parked over the floor beside the table. Measured 4.5% of starts
+            # (10% of `far`, 7.8% of `broad`); home/post_drop never do it. That is
+            # out-of-distribution for the deployment loop, where the arm is always over the
+            # table when a human repositions the cube. Redraw instead.
+            if not self._tcp_over_table(target):
+                continue
             try:
                 qpos = ent.inverse_kinematics(
                     link=self.robot._ee_link,
