@@ -119,6 +119,18 @@ class Cfg:
 
     abort_mode: Literal["newest", "all"] = "newest"
 
+    resume: bool = False
+    """Continue shards that already hold episodes instead of refusing to touch them.
+
+    For each planned shard, counts the VALID episodes already on disk (header+footer MCAP
+    magic) and advances that shard's --seed / --episode-offset / --n-episodes past them, so
+    the remaining episodes get exactly the seeds they would originally have had. Truncated
+    files (a shard killed mid-write) are deleted first.
+
+    Written after the 2026-07-26 incident where an unrelated GPU process tripped the VRAM
+    guard and six shards were killed ~700 episodes in; their MCAPs were all valid, only the
+    manifests (written at natural exit) were lost."""
+
     shard_index_offset: int = 0
     """Name this wave's shard dirs from shard_{offset:02d} upward.
 
@@ -191,19 +203,62 @@ class Shard:
         return attempted, succeeded
 
 
+MCAP_MAGIC = bytes.fromhex("894d434150300d0a")
+
+
+def _valid_done(d: Path, offset: int, delete_truncated: bool = True) -> int:
+    """Episodes already generated for a shard.
+
+    delete_truncated MUST be False under --dry-run: a dry run that mutates the filesystem
+    is not a dry run. It once deleted the in-progress episode of a LIVE shard.
+    """
+    import re
+    if not d.exists():
+        return 0
+    ids = []
+    for f in d.glob("episode_*.mcap"):
+        try:
+            with f.open("rb") as fh:
+                head = fh.read(8)
+                fh.seek(-8, 2)
+                tail = fh.read(8)
+        except OSError:
+            continue
+        if head == MCAP_MAGIC and tail == MCAP_MAGIC:
+            ids.append(int(re.search(r"(\d+)", f.name).group(1)))
+        elif delete_truncated:
+            print(f"  {d.name}: removing truncated {f.name}")
+            f.unlink(missing_ok=True)
+        else:
+            print(f"  {d.name}: would remove truncated {f.name}")
+    return (max(ids) + 1 - offset) if ids else 0
+
+
 def plan(cfg: Cfg) -> list[Shard]:
     base, rem = divmod(cfg.n_episodes, cfg.n_shards)
     shards, offset = [], 0
     for k in range(cfg.n_shards):
         n = base + (1 if k < rem else 0)  # spread the remainder over the first shards
         name_idx = k + cfg.shard_index_offset
+        s_seed = cfg.seed + offset
+        s_off = offset + cfg.episode_index_offset
+        s_n = n
+        if cfg.resume:
+            done = _valid_done(cfg.out_dir / f"shard_{name_idx:02d}", s_off,
+                               delete_truncated=not cfg.dry_run)
+            if done:
+                print(f"  shard_{name_idx:02d}: {done} already done, resuming at "
+                      f"seed {s_seed + done} ({s_n - done} remaining)")
+            s_seed += done
+            s_off += done
+            s_n -= done
         shards.append(
             Shard(
                 idx=name_idx,
                 gpu=cfg.gpus[k % len(cfg.gpus)],
-                seed=cfg.seed + offset,
-                offset=offset + cfg.episode_index_offset,
-                n=n,
+                seed=s_seed,
+                offset=s_off,
+                n=s_n,
                 out=cfg.out_dir / f"shard_{name_idx:02d}",
                 log=cfg.log_dir / f"{cfg.out_dir.name}_shard{name_idx:02d}.log",
             )
@@ -339,7 +394,8 @@ def preflight(cfg: Cfg, shards: list[Shard]) -> list[str]:
     # Never silently overwrite, but DO allow extending: only the shard dirs this wave
     # writes must be empty. Earlier waves' shard_* dirs are left alone and merge_shards
     # folds them all together.
-    clash = [s.out.name for s in shards if list(s.out.glob("episode_*.mcap"))]
+    clash = [] if cfg.resume else [s.out.name for s in shards
+                                   if list(s.out.glob("episode_*.mcap"))]
     if clash:
         problems.append(f"these shard dirs already contain episodes: {clash}; "
                         "raise --shard-index-offset to extend, or use a fresh --out-dir")
