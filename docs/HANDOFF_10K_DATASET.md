@@ -165,6 +165,10 @@ Files: `src/xsim/task_env.py`, `src/xsim/grasp_env.py`.
 in a box, **keeps the home EE orientation**, IK-solves, and seats the arm via
 `set_arm_qpos`. Their production value is `((0.10, 0.40), (-0.3048, 0.3048), (-0.01, 0.30))`.
 Adapt to our single-env `Manipulator` (drop all the n_envs bookkeeping).
+**SUPERSEDED 2026-07-26 — do not follow this.** See "BIGGEST KNOWN PERFORMANCE ISSUE"
+in docs/HANDOFF_20K_CONVERSION.md: upstream's n_envs bookkeeping is its performance
+architecture, not incidental complexity, and advice like this line is why TaskEnv is
+still stuck at n_envs=1.
 
 `Manipulator.reset` (`grasp_env.py:649`) currently takes only `arm_qpos_offset` — add an
 absolute `arm_qpos=` path, keeping the offset behaviour. Solve IK with the existing
@@ -288,6 +292,10 @@ Upstream's lives behind `render_backend="batch"`. Four contained pieces:
 
 Most of upstream's apparent complexity is per-env buffer bookkeeping for `n_envs=2048` that
 is unnecessary at `n_envs=1`.
+**SUPERSEDED 2026-07-26 — this framing is wrong and cost us real throughput.** Batching IS
+the reason Madrona exists; `n_envs=1` was inherited from a single-env demo, never chosen.
+Measured: scene build 10.6 s + startup 14.8 s paid per process, 8x per batch, while physics
+(40%) and IK (18%) both vectorise. See docs/HANDOFF_20K_CONVERSION.md section 4b.
 
 **Open decision for grifflee:** which render path the 10k batch actually uses. The standing
 rule has been "never run model-facing sim without `render_backend=nyx`", but `c82de3e`

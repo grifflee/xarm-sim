@@ -172,6 +172,50 @@ New tools: `run_shards.py` (sharded supervisor with guards + `--resume`),
 
 ---
 
+## 4b. BIGGEST KNOWN PERFORMANCE ISSUE: `n_envs=1`
+
+`TaskEnv` hardcodes `self.scene.build(n_envs=1)` (`task_env.py:985`). Every generation
+shard runs **one** environment and steps episodes serially; parallelism comes from running
+8 separate OS processes.
+
+**This is off Madrona's design point by three orders of magnitude.** Madrona exists to
+render thousands of environments in one process. Upstream does exactly that —
+`scripts/simpledagger.py` runs "one rank per GPU, each owning `n_envs` envs AND a DDP
+replica", with tuning notes about VRAM "peaking ~30GB and OOM'ing 44GB L40S ranks at
+`n_envs >= 2048`" — i.e. mhyatt is batching on this same hardware.
+
+**Why we are not, and it was never a decision.** `n_envs=1` was inherited from the original
+single-environment `GraspEnv` demo and carried forward by `670fd85`, a *rename* commit.
+Nobody weighed batched against serial. It was then actively cemented: this repo's own
+`docs/HANDOFF_10K_DATASET.md` instructs future porting work to strip batching out —
+
+> "Adapt to our single-env `Manipulator` (**drop all the n_envs bookkeeping**)."
+> "Most of upstream's apparent complexity is per-env buffer bookkeeping for `n_envs=2048`
+> that is **unnecessary at n_envs=1**."
+
+That advice reads upstream's batching as incidental complexity rather than as its
+performance architecture, and it is self-reinforcing: single-env, therefore strip
+batching, therefore still single-env. **Do not follow it.**
+
+**Measured cost** (`scripts/bench_render.py`, 2026-07-26, 96x72 batch renderer):
+- one process = **4.90 s/episode**; physics 40% and IK 18% of that, both of which vectorise
+  across environments — that is 58% of the work sitting on the exact axis batching helps;
+- **scene build 10.6 s and process startup 14.8 s are paid PER PROCESS**, and we pay them
+  8x per batch;
+- 8 shards deliver ~3,200 ep/h, versus 735 ep/h for one process — a 4.4x return on 8x the
+  processes, because they contend for 4 GPUs instead of sharing one batched context.
+
+**The foundation already exists**: `GraspEnv` takes `num_envs`
+(`grasp_env.py:256`, `scene.build(n_envs=env_cfg["num_envs"], ...)`). What blocks it is
+that `TaskEnv` is scalar throughout — `cube_pos()`, `reset(seed=...)`, the scripted policy,
+`GraspIntegrity` and the MCAP writer all assume one environment. Vectorising those is real
+work, not a config flag.
+
+**Bounded, not free:** upstream's own comment records OOM at `n_envs >= 2048` on 44 GB
+L40S, so there is a ceiling on this hardware. But anything above 1 is likely a large win,
+and this is a far bigger lever than shard count or render resolution — both of which were
+measured on 2026-07-26 and found close to exhausted.
+
 ## 5. Open items
 
 - **Shard count**: 8 stays. `bench_shards.py` found 4/6/8 all within noise (~3,000–3,200
