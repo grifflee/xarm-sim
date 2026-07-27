@@ -5,6 +5,90 @@ episodes as Foxglove MCAP for training (crossformer). Everything through pilot
 verification is DONE and committed on branch `synthetic-lift-mcap`. Your job is the
 scale-up and its verification. Read this whole file before running anything.
 
+## STANDING RULE: this is a shared box — budget CPU, GPU and RAM before you launch
+
+`luc` is 128 CPU / 4x L40S (46 GB each) / 1 TB RAM, and more than one person works on it at
+a time. Anything you start that runs for hours must state, up front, what it takes on all
+three axes and leave the axes it does not need untouched. Check `nvidia-smi`, `free -g`,
+`uptime` and `df -h` before launching, and again at first steady state.
+
+- **GPU is the scarce one.** Never take VRAM you do not compute on. The arec converter
+  (`mcap_robot_sim.py`) imports JAX transitively and **JAX preallocates ~75% of every visible
+  GPU on import**, with no CUDA code in the script. On 2026-07-26 that tripped
+  `run_shards.py`'s total-VRAM guard at 94% and killed six live generation shards. If a job
+  does not need CUDA, prove it doesn't and pin it off: `JAX_PLATFORMS=cpu` +
+  `CUDA_VISIBLE_DEVICES=""` (verify 0 MiB in `nvidia-smi` after import, and that output is
+  bit-identical to a GPU-visible run on a small sample). `XLA_PYTHON_CLIENT_PREALLOCATE=false`
+  only shrinks the grab; it does not eliminate it.
+- **Memory: always cap, never trust.** Run long jobs under
+  `systemd-run --user --scope -p MemoryMax=<N>G -p MemorySwapMax=0` so a leak kills the job
+  and not the box. This host was crashed once by `compute_dataset_statistics` materialising
+  every record (fixed in crossformer `3c492c0`, streaming Welford). `MemorySwapMax=0` matters
+  as much as the cap: swap-thrashing takes everyone down with you.
+- **CPU: pick the worker count deliberately.** `--mp` defaults to 4 on a 128-core box, and
+  each worker also carries `read_threads=32`. Measure before scaling, and leave headroom for
+  whoever else is on the machine rather than claiming all 128.
+- **Disk: `/nas` (21 TB free) for outputs, never `/home`** — shared NFS at 91%. Cross-check
+  the projected output size against measured bytes/record from a small run first.
+- **Announce and log.** Long jobs in tmux with a log file, and say in the handoff which
+  resources they hold and for how long, so concurrent work can be planned around them.
+
+### Measured resource profile: arec conversion (2026-07-26, 20,995 episodes, 96x72)
+
+Numbers, so the next person does not re-derive them:
+
+- **`--mp` does nothing. Do not tune it.** 100-episode runs at `--mp` 4 / 8 / 16 took
+  130.5 / 130.2 / 130.9 s — identical. `mp_prefetch` sits *before* `sim_calibrate`, so the
+  JAX FK, `pack_record` and the ArrayRecord writes all run serially in the main process and
+  that is the bottleneck; extra workers only widen a queue that is not the constraint. Use
+  `--mp 4` (same speed, lowest RSS). The handoff's "more workers may halve it" is **wrong**.
+- **Throughput 1,474 rec/s — the whole 21k set converts in 44 minutes.** The handoff's
+  8.4 h estimate, and the 129 rec/s behind it, were both real measurements of a codebase
+  that was doing ~7/8 useless work. See the next bullet.
+- **THE BIG ONE: `robot_keypoints_in_cameras` rebuilt the entire robot model per episode.**
+  Its first line was `RobotKeypoints(urdf_path, mesh_dir)`, and that constructor loads and
+  merges every mesh in the URDF (trimesh `merge_vertices`) *and* builds a fresh
+  `jax.jit` wrapper. A jit wrapper's compiled-code cache lives **on the wrapper object**, so
+  a new one every episode meant tracing, lowering and compiling the FK to get exactly one
+  call out of it — 20,995 times, plus 20,995 full mesh re-parses. Fixed by memoising the
+  instance (`crossformer/run/dream.py`, `_cached_keypoints`, `lru_cache`). **4.3x end to
+  end: 250 -> 1,474 rec/s, 4.3 h -> 44 min.** The same call sits in `from_mcap.py`, so every
+  real-robot arec build was paying it too.
+  - Two things hid this. JAX's *persistent on-disk* compile cache turned most of the
+    recompiles into cache hits, so throughput **improved** over a run (129 -> 250 rec/s) and
+    read as healthy warm-up rather than pathology. And the cost is linear in episode count,
+    so at the previous scale (2,500 episodes) it just looked like "conversion is slow."
+  - It is also why `--mp` tuning looked like the lever and wasn't: the waste was all in the
+    single main process, downstream of `mp_prefetch`.
+  - **Diagnose this class of problem with `ps` then `py-spy`, not by tuning flags.** `ps`
+    showed main at 125% CPU with all four workers at ~6% — a saturated consumer, so the
+    producers cannot be the constraint. `uvx py-spy dump --pid <main> --nonblocking`,
+    sampled ~8 times, put 5 samples in JAX compilation and 2 in trimesh mesh merging: both
+    startup-only costs, appearing 25 minutes into a run.
+- **Expect ~1e-7 float32 noise between any two arec builds.** XLA autotunes matmul kernels
+  at compile time and picks whichever benchmarks fastest *that moment*; float addition is
+  not associative, so `kp3dw_robot`/`kp3dc_robot` differ by 1-2 ULP (60-240 nm) run to run.
+  Verified by building the same 100 episodes twice with identical code: images are
+  bit-identical, proprio is not. **Do not diff arec shards by md5 and conclude a code change
+  broke something** — decode and compare numerically. Nothing else in the record varies.
+- **VRAM: one 34.5 GB grab on GPU 0, flat.** It does not scale with `--mp` — prefetch workers
+  never touch a device. JAX preallocates once at backend init and the arena is static
+  thereafter, so the job cannot grow into a VRAM OOM. GPUs 1-3 stay free for other work.
+- **VRAM OOM cannot crash the box; DRAM OOM can.** A GPU OOM surfaces as a
+  `RESOURCE_EXHAUSTED` Python exception that kills the process and nothing else. Only DRAM
+  exhaustion threatens the host, which is what `MemoryMax` + `MemorySwapMax=0` are for.
+- **The write path does not accumulate.** `_build_from_stream` (`arec.py:229`) holds
+  `last_sample` plus one `writer_last` entry per writer, all overwritten each iteration —
+  O(1) in record count. `compute_dataset_statistics` is **not** called during a build (stats
+  are computed at load time), so the crash that motivated the memory cap is not on this path.
+  `McapLoader` opens one file per `read_mcap` call and retains no handles.
+- **Skip the counting pass with `--est-steps`.** `main()` otherwise builds and drains the
+  whole dataset a second time, fully decoding every image across all MCAPs, purely to sum
+  `info.len` for a tqdm total. It is not a memory leak — it is a generator expression, not a
+  `list()` — but it is an entire wasted read pass. `total` feeds only `cfg.progress()`
+  (`write.py:69`), a tqdm tick that returns `x` unchanged, so the flag is provably cosmetic.
+- **Output size: ~25 KB/record** → ~97 GB for the 21k set. Input hard links cost nothing.
+
 ## 2026-07-26: pre-10k session — grasp gate, spawn region, 96x72, machine port
 
 Read this before touching generation; several long-standing assumptions were wrong.

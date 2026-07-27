@@ -33,7 +33,58 @@ robot episodes in `~/ghome/mcaps/lift_valid`.
 
 ---
 
-## 2. THE NEXT STEP: arec conversion — read all of this before running it
+## 2. arec conversion — **DONE 2026-07-26 23:02**
+
+`xarm_sim_96` v0.0.1 is built and verified at `/nas/glee10/arrayrecords/xarm_sim_96`,
+symlinked to `~/.cache/arrayrecords/xarm_sim_96`.
+
+| | |
+|---|---|
+| episodes | 20,995 (all present, contiguous idx 0–20994) |
+| records | 3,882,631 (184.93/episode vs 185.04 baseline) |
+| size | 94 GB — image 92 GB / proprio 2.1 GB, 777 shards each |
+| build | 2,634 s = **44 min** at 1,474 rec/s |
+| peak RSS | 11.1 GB (flat after warm-up; cap was 200 GB) |
+| VRAM | one 34.5 GB grab on GPU 0 only |
+
+**Two things in the original plan below were wrong, and are left in place with corrections
+so the reasoning is auditable:**
+
+1. **`--mp` tuning is not a lever** (§2d suggested it might halve the run). Measured
+   4/8/16 = 130.5/130.2/130.9 s, identical. The bottleneck was the single main process
+   downstream of `mp_prefetch`; the workers idled at ~6% CPU.
+2. **The 8.4 h estimate (and the 129 rec/s behind it) measured a real defect, not a floor.**
+   `robot_keypoints_in_cameras` rebuilt the whole robot model — full URDF mesh load plus a
+   fresh `jax.jit` compile — once per episode, ~7/8 of main-process time. Fixed in
+   crossformer `e881a76`. The run took 44 minutes. See `AGENTS.md` for the full diagnosis
+   and the `ps` → `py-spy` method that found it.
+
+Also note: the §2d write-pass timing excluded the counting pass in `main()`, which fully
+decodes every image in every MCAP a second time just to sum a tqdm total. `--est-steps`
+skips it; `total` feeds only `cfg.progress()`, so it is provably cosmetic.
+
+### The command actually used
+
+```bash
+cd ~/ghome/crossformer
+systemd-run --user --scope -p MemoryMax=200G -p MemorySwapMax=0 -- \
+  uv run --no-sync python scripts/data/make/mcap_robot_sim.py \
+    --mode build --no-recursive --mp 4 \
+    --name xarm_sim_96 --version 0.0.1 \
+    --path /nas/glee10/sim_mcaps/lift_21k_flat \
+    --root /nas/glee10/arrayrecords \
+    --est-steps 3884915 \
+    --urdf /home/glee10/ghome/xarm-sim/xarm7_standalone.urdf \
+    --mesh-dir /home/glee10/ghome/xarm-sim/assets
+```
+
+The flat input dir `/nas/glee10/sim_mcaps/lift_21k_flat` (20,995 hard links, every file
+head+tail magic-validated, 0 rejected) is **kept** — it is the provenance record of exactly
+what was converted, and hard links cost no disk.
+
+---
+
+## 2 (original). The plan as written before the run
 
 ### 2a. `merge_shards.py` will silently drop ~4,300 episodes. Do not use it here.
 
