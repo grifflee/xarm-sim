@@ -231,7 +231,17 @@ def _valid_done(d: Path, offset: int, delete_truncated: bool = True) -> int:
             f.unlink(missing_ok=True)
         else:
             print(f"  {d.name}: would remove truncated {f.name}")
-    return (max(ids) + 1 - offset) if ids else 0
+    if not ids:
+        return 0
+    done = max(ids) + 1 - offset
+    holes = sorted(set(range(offset, offset + done)) - set(ids))
+    if holes:
+        # Resume continues at max_valid+1, so an INTERIOR hole is stepped over, not
+        # refilled -- a truncated tail is recovered, a gap further back is not. Report it
+        # rather than let the operator assume a resumed shard is contiguous.
+        print(f"  {d.name}: WARNING {len(holes)} interior gap(s) will NOT be refilled "
+              f"by resume: {holes[:5]}{'...' if len(holes) > 5 else ''}")
+    return done
 
 
 def plan(cfg: Cfg) -> list[Shard]:

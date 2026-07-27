@@ -151,9 +151,15 @@ New tools: `run_shards.py` (sharded supervisor with guards + `--resume`),
 
 ## 4. Known damage and quirks in this dataset
 
-- **8 single-episode gaps** in the numbering: 6 files truncated when the guard killed
-  shards mid-write, 2 destroyed by a destructive `--dry-run` (since fixed). Immaterial at
-  21,000 episodes; the flat-link script in §2a skips them by magic-byte check.
+- **3 permanently missing episodes**: `011365`, `012644`, `013613`. Eight files were
+  deleted in total (6 truncated by the guard kill, 2 destroyed by a `--dry-run` that
+  mutated the filesystem, since fixed), but `--resume` regenerated five of them because
+  those were each shard's *last* write and resuming at `max_valid + 1` landed on them.
+  The three above were not: two were live writes in shards that were never resumed, and
+  `013613` was a hole *mid-sequence*, which `--resume` steps over rather than fills.
+  **Known limitation of `--resume`: it recovers a truncated tail, not an interior hole.**
+  Immaterial at 21,000 episodes, and the flat-link script in §2a skips holes anyway since
+  it renumbers contiguously.
 - **Shards 10–15 have incomplete manifests** (resumed portion only). The episodes are fine;
   the per-episode diagnostics (spawn, `close_xy_err`, light draws) for their first ~700
   episodes each are permanently lost. Nothing downstream needs them — the converter reads
