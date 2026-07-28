@@ -25,10 +25,10 @@ def _yaw_from_quat_wxyz(quat) -> float:
 
 def episode_result(env: TaskEnv, cfg, max_rise: float) -> dict:
     """Task-specific success stats, computed after the unrecorded settle."""
-    cube_end = env.cube_pos()
+    cube_end = env.cube_pos_batch()[0]
     lifted = max_rise >= cfg.lift_threshold
     if cfg.task == "stack":
-        green = env.green_pos()
+        green = env.green_pos_batch()[0]
         stack_z = env.cfg.table.top_z + 1.5 * BLOCK_SIZE
         xy_err = float(np.linalg.norm(cube_end[:2] - green[:2]))
         z_err = float(cube_end[2] - stack_z)
@@ -44,7 +44,7 @@ def episode_result(env: TaskEnv, cfg, max_rise: float) -> dict:
             "stacked": stacked, "success": lifted and stacked,
             "green_pos": [float(v) for v in green],
         }
-    drop = np.asarray(env.current_drop_xy)
+    drop = env.drop_xy_batch()[0]
     deliver_dist = float(np.linalg.norm(cube_end[:2] - drop))
     delivered = deliver_dist <= cfg.deliver_radius and float(cube_end[2]) < 0.05
     return {

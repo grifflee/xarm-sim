@@ -156,6 +156,22 @@ def _as_single_np(value) -> np.ndarray:
     return arr
 
 
+def _as_batch_np(value, *, width: int | None = None) -> np.ndarray:
+    """Return Genesis/Torch state with an explicit leading environment axis."""
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    if width is not None:
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        if arr.ndim != 2 or arr.shape[1] < width:
+            raise ValueError(f"expected batched state with width >= {width}, got {arr.shape}")
+        arr = arr[:, :width]
+    return np.ascontiguousarray(arr)
+
+
 def _quat_wxyz_to_rot(quat) -> np.ndarray:
     w, x, y, z = _as_single_np(quat)
     n = math.sqrt(w * w + x * x + y * y + z * z)
@@ -604,6 +620,9 @@ class StackCfg:
 class TaskEnvCfg:
     task: Literal["lift", "stack"] = "lift"
     stack: StackCfg = field(default_factory=StackCfg)
+    # Milestone A makes the public state contract batch-shaped at B=1. B>1 is
+    # enabled after reset/policy/recording own independent per-slot lifecycle state.
+    n_envs: int = 1
     # 96x72: the floor, not a quality setting.
     #
     # crossformer's loader ends every frame at 64x64 via a plain cv2.resize
@@ -843,6 +862,14 @@ class TaskEnvCfg:
 class TaskEnv:
     def __init__(self, cfg: TaskEnvCfg | None = None, robot_cfg: dict | None = None, cameras=DEFAULT_CAMERAS):
         self.cfg = cfg or TaskEnvCfg()
+        if self.cfg.n_envs < 1:
+            raise ValueError(f"n_envs must be >= 1, got {self.cfg.n_envs}")
+        if self.cfg.n_envs != 1:
+            raise NotImplementedError(
+                "Milestone A supports the batch-shaped contract at n_envs=1; "
+                "multi-environment execution is enabled in Milestone B"
+            )
+        self.n_envs = self.cfg.n_envs
         self.robot_cfg = dict(robot_cfg or XARM7_ROBOT_CFG)
         if self.cfg.robot_decompose_robot_error_threshold is not None:
             self.robot_cfg["decompose_robot_error_threshold"] = (
@@ -947,7 +974,9 @@ class TaskEnv:
             )
 
         # robot (base at world origin, on the table top)
-        self.robot = Manipulator(num_envs=1, scene=self.scene, args=self.robot_cfg, device=gs.device)
+        self.robot = Manipulator(
+            num_envs=self.n_envs, scene=self.scene, args=self.robot_cfg, device=gs.device
+        )
         _apply_robot_shine(self.robot._robot_entity, self.episode_appearance["robot_roughness_scale"])
 
         # red cube (high friction so the gripper can hold it)
@@ -982,7 +1011,7 @@ class TaskEnv:
         self.episode_shadow_strength = float(self.cfg.batch_shadow_strength)
         self._add_cameras()
 
-        self.scene.build(n_envs=1)
+        self.scene.build(n_envs=self.n_envs)
         if self._batch_shadow_catcher is not None:
             entity_idx = self._batch_shadow_catcher.idx
             for seg_idx, key in self.scene.visualizer.segmentation_idx_dict.items():
@@ -1763,6 +1792,21 @@ class TaskEnv:
             out[name] = np.ascontiguousarray(rgb[..., :3]).astype(np.uint8)
         return out
 
+    def render_batch(self) -> dict[str, np.ndarray]:
+        """Named RGB views with an explicit ``(n_envs, H, W, 3)`` shape."""
+        out = {}
+        for name, value in self.render().items():
+            arr = np.asarray(value, dtype=np.uint8)
+            if arr.ndim == 3:
+                arr = arr[None, ...]
+            if arr.ndim != 4 or arr.shape[0] != self.n_envs:
+                raise ValueError(
+                    f"camera {name!r} has shape {arr.shape}, "
+                    f"expected ({self.n_envs}, H, W, C)"
+                )
+            out[name] = np.ascontiguousarray(arr[..., :3])
+        return out
+
     # ~1.5 cube widths inside the frame edge, calibrated at 640 px wide. Scaled with the
     # render width so the margin stays the same physical distance rather than silently
     # becoming stricter when the resolution drops.
@@ -1809,6 +1853,19 @@ class TaskEnv:
             cam_to_world_gl = cam_to_world_gl[0]
         return cam_to_world_gl @ T_GL_TO_CV
 
+    def extrinsics_batch(self) -> dict[str, np.ndarray]:
+        """Episode camera transforms, each shaped ``(n_envs, 4, 4)``."""
+        out = {}
+        for key, value in self.episode_extrinsics.items():
+            arr = np.asarray(value, dtype=np.float64)
+            if arr.ndim == 2:
+                arr = arr[None, ...]
+            expected = (self.n_envs, 4, 4)
+            if arr.shape != expected:
+                raise ValueError(f"extrinsic {key!r} has shape {arr.shape}, expected {expected}")
+            out[key] = np.ascontiguousarray(arr)
+        return out
+
     def proprio(self):
         """Return (joint_pos, joint_vel, joint_eff) for the 7 arm joints and the EE pose."""
         ent = self.robot._robot_entity
@@ -1818,20 +1875,75 @@ class TaskEnv:
         ee = np.asarray(self.robot.ee_pose.cpu()).reshape(-1)  # [x,y,z, qw,qx,qy,qz]
         return pos, vel, force, ee
 
+    def proprio_batch(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return arm and EE state as three ``(B,7)`` arrays plus EE ``(B,7)``."""
+        ent = self.robot._robot_entity
+        return (
+            _as_batch_np(ent.get_dofs_position(), width=7),
+            _as_batch_np(ent.get_dofs_velocity(), width=7),
+            _as_batch_np(ent.get_dofs_force(), width=7),
+            _as_batch_np(self.robot.ee_pose, width=7),
+        )
+
     def gripper_norm(self) -> float:
         """Normalized gripper opening in [0,1] (1=open, 0=closed), matching bela convention."""
         g = float(np.asarray(self.robot._robot_entity.get_dofs_position().cpu()).reshape(-1)[self.robot._arm_dof_dim])
         close = float(self.robot_cfg["gripper_close_dof"]) or 0.85
         return float(np.clip(1.0 - g / close, 0.0, 1.0))
 
+    def gripper_norm_batch(self) -> np.ndarray:
+        """Normalized gripper opening for every environment, shape ``(B,)``."""
+        qpos = _as_batch_np(self.robot._robot_entity.get_dofs_position())
+        if qpos.ndim == 1:
+            qpos = qpos.reshape(1, -1)
+        g = qpos[:, self.robot._arm_dof_dim]
+        close = float(self.robot_cfg["gripper_close_dof"]) or 0.85
+        return np.ascontiguousarray(np.clip(1.0 - g / close, 0.0, 1.0))
+
     def cube_pos(self) -> np.ndarray:
         return np.asarray(self.cube.get_pos().cpu()).reshape(-1)
+
+    def cube_pos_batch(self) -> np.ndarray:
+        """Red cube position for every environment, shape ``(B,3)``."""
+        return _as_batch_np(self.cube.get_pos(), width=3)
+
+    def cube_yaw_batch(self) -> np.ndarray:
+        """Reset-sampled red cube yaw for every environment, shape ``(B,)``."""
+        yaw = np.asarray(self._cube_yaw, dtype=np.float64)
+        return np.ascontiguousarray(
+            yaw.reshape(1) if yaw.ndim == 0 else yaw.reshape(self.n_envs)
+        )
+
+    def drop_xy_batch(self) -> np.ndarray:
+        """Episode drop targets for every environment, shape ``(B,2)``."""
+        drop = np.asarray(self.current_drop_xy, dtype=np.float64)
+        if drop.ndim == 1:
+            drop = drop.reshape(1, 2)
+        expected = (self.n_envs, 2)
+        if drop.shape != expected:
+            raise ValueError(f"drop targets have shape {drop.shape}, expected {expected}")
+        return np.ascontiguousarray(drop)
 
     def green_pos(self) -> np.ndarray:
         """Green target cube position (stack task only)."""
         if self.cube2 is None:
             raise RuntimeError("green cube only exists when cfg.task == 'stack'")
         return np.asarray(self.cube2.get_pos().cpu()).reshape(-1)
+
+    def green_pos_batch(self) -> np.ndarray:
+        """Green cube position for every environment, shape ``(B,3)``."""
+        if self.cube2 is None:
+            raise RuntimeError("green cube only exists when cfg.task == 'stack'")
+        return _as_batch_np(self.cube2.get_pos(), width=3)
+
+    def green_yaw_batch(self) -> np.ndarray:
+        """Reset-sampled green cube yaw for every environment, shape ``(B,)``."""
+        if self.cube2 is None:
+            raise RuntimeError("green cube only exists when cfg.task == 'stack'")
+        yaw = np.asarray(self._green_yaw, dtype=np.float64)
+        return np.ascontiguousarray(
+            yaw.reshape(1) if yaw.ndim == 0 else yaw.reshape(self.n_envs)
+        )
 
     def green_yaw(self) -> float:
         """Green cube yaw (rad) sampled at reset; used to align the placed cube's faces."""

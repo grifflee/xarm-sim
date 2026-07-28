@@ -163,11 +163,11 @@ class GraspIntegrity:
 
     def observe(self, step_idx: int, cmd) -> None:
         ee = np.asarray(self.env.robot.ee_pose.detach().cpu(), dtype=np.float64).reshape(-1)[:3]
-        cube = np.asarray(self.env.cube_pos(), dtype=np.float64).reshape(-1)[:3]
+        cube = self.env.cube_pos_batch()[0]
         dist = float(np.linalg.norm(ee - cube))
         xy_err = float(np.linalg.norm(ee[:2] - cube[:2]))
         z_err = abs(float(ee[2] - (self.env.cfg.table.top_z + self.cfg.grasp_tcp_offset)))
-        gripper_norm = float(self.env.gripper_norm())
+        gripper_norm = float(self.env.gripper_norm_batch()[0])
         if not self.weld_fired:
             self.min_ee_cube = min(self.min_ee_cube, dist)
 
@@ -540,7 +540,7 @@ def _preview_camera_names(images: dict[str, np.ndarray]) -> list[str]:
 
 
 def save_preview_frame(env: TaskEnv, preview_dir: Path, step_idx: int, label: str) -> None:
-    images = env.render()
+    images = {name: frames[0] for name, frames in env.render_batch().items()}
     safe = _safe_label(label)
     names = _preview_camera_names(images)
     for name in names:
@@ -616,10 +616,13 @@ def run_video(env: TaskEnv, cfg: Config) -> None:
     policy = _make_policy(env, cfg)
     policy.reset()
     integrity = GraspIntegrity(env, cfg, policy)
-    cube_start = env.cube_pos().copy()
+    cube_start = env.cube_pos_batch()[0].copy()
     max_rise = 0.0
 
-    first = contact_sheet(env.render(), f"0000 reset seed={cfg.seed}")
+    first = contact_sheet(
+        {name: frames[0] for name, frames in env.render_batch().items()},
+        f"0000 reset seed={cfg.seed}",
+    )
     height, width = first.shape[:2]
     writer = cv2.VideoWriter(
         str(cfg.video_path),
@@ -639,10 +642,13 @@ def run_video(env: TaskEnv, cfg: Config) -> None:
             for step_idx in range(record_until):
                 cmd = policy.step()
                 _advance_policy_step(env, cfg, policy, integrity, step_idx, cmd)
-                cube = env.cube_pos()
+                cube = env.cube_pos_batch()[0]
                 max_rise = max(max_rise, float(cube[2] - cube_start[2]))
                 if step_idx % env.cfg.record_every == 0:
-                    sheet = contact_sheet(env.render(), f"{frame_idx:04d}")
+                    sheet = contact_sheet(
+                        {name: frames[0] for name, frames in env.render_batch().items()},
+                        f"{frame_idx:04d}",
+                    )
                     writer.write(cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR))
                     frame_idx += 1
             # unrecorded settle for the success stats, matching run_episode
@@ -670,7 +676,7 @@ def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict
     policy.reset()
     integrity = GraspIntegrity(env, cfg, policy)
 
-    cube_start = env.cube_pos().copy()
+    cube_start = env.cube_pos_batch()[0].copy()
     max_rise = 0.0
     record_dt_ns = int(round(env.record_dt * 1e9))
     base_ns = 1_000_000_000
@@ -682,18 +688,28 @@ def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict
     release_tail = max(1, int(round(cfg.release_tail_s / env.cfg.physics_dt)))
     record_until = policy.release_step + release_tail
     with EpisodeMcapWriter(path, specs) as writer:
-        writer.log_calibration(base_ns, env.episode_extrinsics)
+        writer.log_calibration(
+            base_ns, {name: value[0] for name, value in env.extrinsics_batch().items()}
+        )
         with torch.no_grad():
             for i in range(record_until):
                 cmd = policy.step()
                 _advance_policy_step(env, cfg, policy, integrity, i, cmd)
-                cube = env.cube_pos()
+                cube = env.cube_pos_batch()[0]
                 max_rise = max(max_rise, float(cube[2] - cube_start[2]))
                 if i % env.cfg.record_every == 0:
-                    imgs = env.render()
-                    pos, vel, eff, ee = env.proprio()
-                    writer.log_step(base_ns + rec * record_dt_ns, imgs, pos, vel, eff, None,
-                                    ee_pose=ee, gripper_norm=env.gripper_norm())
+                    imgs = {name: frames[0] for name, frames in env.render_batch().items()}
+                    pos_b, vel_b, eff_b, ee_b = env.proprio_batch()
+                    writer.log_step(
+                        base_ns + rec * record_dt_ns,
+                        imgs,
+                        pos_b[0],
+                        vel_b[0],
+                        eff_b[0],
+                        None,
+                        ee_pose=ee_b[0],
+                        gripper_norm=float(env.gripper_norm_batch()[0]),
+                    )
                     rec += 1
                 if integrity.abort_reason is not None:
                     # Measured-bad grasp: stop before carrying it. The episode scores as a
@@ -707,7 +723,9 @@ def run_episode(env: TaskEnv, cfg: Config, episode_idx: int, path: Path) -> dict
                     env.step()
 
     stats = {
-        "episode": global_episode, "frames": rec, "cube_yaw": float(env.cube_yaw()),
+        "episode": global_episode,
+        "frames": rec,
+        "cube_yaw": float(env.cube_yaw_batch()[0]),
         # actual (jittered) camera poses this episode: c2w OpenCV for low/side, plus the
         # link_tcp->camera(optical) wrist mount; also written into the MCAP itself
         # (camera_info + /tf) via log_calibration

@@ -38,12 +38,12 @@ class ScriptedStackPolicy(ScriptedLiftPolicy):
         device = env.device
         ee = env.robot.ee_pose.clone().reshape(-1)          # [7]
         home_quat = ee[3:7].clone()
-        cube = torch.as_tensor(env.cube_pos(), device=device, dtype=ee.dtype)   # red [3]
-        green = torch.as_tensor(env.green_pos(), device=device, dtype=ee.dtype)  # target [3]
+        cube = torch.as_tensor(env.cube_pos_batch()[0], device=device, dtype=ee.dtype)   # red [3]
+        green = torch.as_tensor(env.green_pos_batch()[0], device=device, dtype=ee.dtype)  # target [3]
         top_z = env.cfg.table.top_z
 
         grasp_quat = torch.as_tensor(
-            _nearest_side_grasp_quat(float(env.cube_yaw()), home_quat),
+            _nearest_side_grasp_quat(float(env.cube_yaw_batch()[0]), home_quat),
             device=device,
             dtype=ee.dtype,
         )
@@ -64,7 +64,9 @@ class ScriptedStackPolicy(ScriptedLiftPolicy):
         # twisting the wrist by the nearest 90-degree-equivalent yaw difference between
         # the two cubes squares red's faces with green's. The twist happens over the
         # transport segment (the lerp renormalizes quats), never exceeding 45 degrees.
-        delta = (float(env.green_yaw()) - float(env.cube_yaw())) % (math.pi / 2.0)
+        delta = (
+            float(env.green_yaw_batch()[0]) - float(env.cube_yaw_batch()[0])
+        ) % (math.pi / 2.0)
         if delta >= math.pi / 4.0:
             delta -= math.pi / 2.0
         # recover the chosen grasp yaw from the (0, cos(h), sin(h), 0) top-down quat

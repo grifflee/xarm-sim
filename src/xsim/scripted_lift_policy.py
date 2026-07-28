@@ -113,15 +113,17 @@ class ScriptedLiftPolicy:
         device = env.device
         ee = env.robot.ee_pose.clone().reshape(-1)          # [7]
         home_quat = ee[3:7].clone()
-        cube = torch.as_tensor(env.cube_pos(), device=device, dtype=ee.dtype)  # [3]
-        drop_x, drop_y = env.current_drop_xy
+        cube = torch.as_tensor(
+            env.cube_pos_batch()[0], device=device, dtype=ee.dtype
+        )  # slot 0, [3]; policy becomes per-slot in Milestone B
+        drop_x, drop_y = env.drop_xy_batch()[0]
         top_z = env.cfg.table.top_z
 
         # Align the fingers with cube faces, but choose the 90-degree-equivalent side
         # grasp closest to the current wrist orientation. This avoids unnecessary quarter
         # turns while still closing on side faces instead of cube edges.
         grasp_quat = torch.as_tensor(
-            _nearest_side_grasp_quat(float(env.cube_yaw()), home_quat),
+            _nearest_side_grasp_quat(float(env.cube_yaw_batch()[0]), home_quat),
             device=device,
             dtype=ee.dtype,
         )
